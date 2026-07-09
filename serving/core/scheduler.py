@@ -819,8 +819,8 @@ class Scheduler:
         return self.batch_ids
 
     # add a request
-    def add_request(self, req, is_init=True):
-        new_req = Request(*(req), is_init=is_init)
+    def add_request(self, req, is_init=True, session_id=None, sub_request_index=None):
+        new_req = Request(*(req), is_init=is_init, session_id=session_id, sub_request_index=sub_request_index)
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
         return
@@ -934,7 +934,8 @@ class Scheduler:
             if not is_append:
                 writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
                                 'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
+                                'queuing_delay', 'TTFT', 'TPOT', 'ITL',
+                                'session_id', 'sub_request_index'])
             
             # Write each request's information
             for req in self.done:
@@ -950,7 +951,9 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl
+                    req.itl,
+                    req.session_id if req.session_id is not None else '',
+                    req.sub_request_index if req.sub_request_index is not None else '',
                 ])
 
 

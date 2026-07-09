@@ -1,6 +1,19 @@
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(
+        self,
+        id,
+        model,
+        input,
+        output,
+        arrival,
+        instance_id,
+        input_hash_ids=None,
+        output_hash_ids=None,
+        is_init=True,
+        session_id=None,
+        sub_request_index=None,
+    ):
         self.id = id
         self.model = model
         self.input = input  # Always keep original input length
@@ -38,8 +51,8 @@ class Request:
         self._prefix_storage_stats_counted = False
 
         # For agentic session tracking (informational, does not drive scheduling)
-        self.session_id = None
-        self.sub_request_index = None
+        self.session_id = session_id
+        self.sub_request_index = sub_request_index
 
     # to print the request information
     def __str__(self):

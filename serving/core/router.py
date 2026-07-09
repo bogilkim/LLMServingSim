@@ -96,6 +96,84 @@ class Router:
     def _custom_select(self, schedulers, role):
         raise NotImplementedError("Implement custom routing policy.")
 
+    def _normalize_route_to(self, route_to):
+        normalized = 'prefill' if route_to is None else str(route_to).lower()
+        if normalized not in ('prefill', 'decode'):
+            raise ValueError(
+                f"Invalid route_to '{route_to}'. Supported values: prefill, decode"
+            )
+        return normalized
+
+    def _make_request_data(self, source, req_id, arrival_time_ns, enable_prefix_caching,
+                           defaults=None, session_id=None, sub_request_index=None):
+        defaults = defaults or {}
+        req_data = {
+            'index': req_id,
+            'input_toks': int(source['input_toks']),
+            'output_toks': int(source['input_toks'] + source['output_toks']),
+            'arrival_time_ns': int(arrival_time_ns),
+        }
+
+        model_name = source.get('model_name', defaults.get('model_name'))
+        if model_name is not None:
+            req_data['model_name'] = model_name
+
+        route_to = source.get('route_to', defaults.get('route_to'))
+        req_data['route_to'] = self._normalize_route_to(route_to)
+
+        instance_id = source.get('instance_id', defaults.get('instance_id'))
+        if instance_id is not None:
+            req_data['instance_id'] = int(instance_id)
+
+        if session_id is not None:
+            req_data['session_id'] = session_id
+        if sub_request_index is not None:
+            req_data['sub_request_index'] = sub_request_index
+
+        if enable_prefix_caching:
+            req_data['input_hash_ids'] = source.get('input_tok_ids', [])
+            req_data['output_hash_ids'] = source.get('output_tok_ids', [])
+        return req_data
+
+    def _select_scheduler_for_request(self, req_data):
+        route_to = self._normalize_route_to(req_data.get('route_to'))
+        candidates = self.prefill_schedulers if route_to == 'prefill' else self.decode_schedulers
+        if not candidates:
+            raise LookupError(
+                f"No {route_to} schedulers are available for request {req_data.get('index')}"
+            )
+
+        instance_id = req_data.get('instance_id')
+        model_name = req_data.get('model_name')
+
+        if instance_id is not None:
+            idx = int(instance_id)
+            if idx < 0 or idx >= len(self.schedulers):
+                raise IndexError(
+                    f"Requested instance_id {idx} for request {req_data.get('index')} is out of range"
+                )
+            sched = self.schedulers[idx]
+            if sched not in candidates:
+                raise ValueError(
+                    f"Requested instance_id {idx} for request {req_data.get('index')} does not belong to the {route_to} pool"
+                )
+            if model_name is not None and sched.model != model_name:
+                raise ValueError(
+                    f"Requested instance_id {idx} for request {req_data.get('index')} runs model {sched.model!r}, "
+                    f"but the workload requested {model_name!r}"
+                )
+            return sched
+
+        if model_name is not None:
+            candidates = [sched for sched in candidates if sched.model == model_name]
+            if not candidates:
+                raise LookupError(
+                    f"No {route_to} scheduler matches model {model_name!r} for request {req_data.get('index')}"
+                )
+
+        instance_idx = self._select_instance(candidates, route_to)
+        return candidates[instance_idx]
+
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
     # -----------------------------------------------------------------------
@@ -106,6 +184,12 @@ class Router:
         Supports two JSONL formats:
         - Flat: {"input_toks", "output_toks", "arrival_time_ns", ...}
         - Agentic session: {"session_id", "arrival_time_ns", "sub_requests": [...]}
+
+        Requests and sub-requests may optionally carry routing metadata:
+        ``model_name`` to target a specific scheduler model, ``route_to``
+        to pick the prefill/decode instance pool, and ``instance_id`` to
+        pin a specific scheduler. This is what lets speculative-decoding
+        traces alternate draft/verifier model calls.
 
         For agentic sessions, only the first sub-request is added to the
         pending queue. Subsequent sub-requests are released dynamically
@@ -140,15 +224,7 @@ class Router:
         """Load a single flat request into pending queue."""
         req_id = self._next_request_id
         self._next_request_id += 1
-        req_data = {
-            'index': req_id,
-            'input_toks': int(row['input_toks']),
-            'output_toks': int(row['input_toks'] + row['output_toks']),
-            'arrival_time_ns': int(row['arrival_time_ns']),
-        }
-        if enable_prefix_caching:
-            req_data['input_hash_ids'] = row.get('input_tok_ids', [])
-            req_data['output_hash_ids'] = row.get('output_tok_ids', [])
+        req_data = self._make_request_data(row, req_id, row['arrival_time_ns'], enable_prefix_caching)
         self._pending_requests.append(req_data)
 
     def _load_agentic_session(self, row, enable_prefix_caching):
@@ -160,27 +236,26 @@ class Router:
         base_id = self._next_request_id
         self._next_request_id += len(sub_reqs)
         arrival_ns = int(row['arrival_time_ns'])
+        session_defaults = {
+            'model_name': row.get('model_name'),
+            'route_to': row.get('route_to'),
+            'instance_id': row.get('instance_id'),
+        }
 
         # Store session state for dependency chain
         self._deferred_sessions[session_id] = {
             'sub_requests': sub_reqs,
             'next_index': 1,  # index 0 is being queued now
             'id_base': base_id,
+            'defaults': session_defaults,
         }
 
         # Queue the first sub-request
         first = sub_reqs[0]
-        req_data = {
-            'index': base_id,
-            'input_toks': int(first['input_toks']),
-            'output_toks': int(first['input_toks'] + first['output_toks']),
-            'arrival_time_ns': arrival_ns,
-            'session_id': session_id,
-            'sub_request_index': 0,
-        }
-        if enable_prefix_caching:
-            req_data['input_hash_ids'] = first.get('input_tok_ids', [])
-            req_data['output_hash_ids'] = first.get('output_tok_ids', [])
+        req_data = self._make_request_data(
+            first, base_id, arrival_ns, enable_prefix_caching,
+            defaults=session_defaults, session_id=session_id, sub_request_index=0,
+        )
         self._pending_requests.append(req_data)
         self._request_to_session[base_id] = (session_id, 0)
 
@@ -198,8 +273,7 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
-            sched = self.prefill_schedulers[instance_id]
+            sched = self._select_scheduler_for_request(req_data)
 
             if sched.enable_prefix_caching:
                 sched.add_request([
@@ -207,13 +281,17 @@ class Router:
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                     req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
-                ], is_init=self._is_init)
+                ], is_init=self._is_init,
+                   session_id=req_data.get('session_id'),
+                   sub_request_index=req_data.get('sub_request_index'))
             else:
                 sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
-                ], is_init=self._is_init)
+                ], is_init=self._is_init,
+                   session_id=req_data.get('session_id'),
+                   sub_request_index=req_data.get('sub_request_index'))
 
             self._pending_idx += 1
             routed += 1
@@ -251,6 +329,7 @@ class Router:
         sub_reqs = session['sub_requests']
         next_idx = session['next_index']
         base_id = session['id_base']
+        session_defaults = session.get('defaults', {})
 
         # Get tool duration from the completed sub-request
         tool_duration_ns = int(sub_reqs[completed_idx].get('tool_duration_ns', 0))
@@ -260,23 +339,16 @@ class Router:
             # Release next sub-request
             next_sub = sub_reqs[next_idx]
             next_id = base_id + next_idx
-            req_data = {
-                'index': next_id,
-                'input_toks': int(next_sub['input_toks']),
-                'output_toks': int(next_sub['input_toks'] + next_sub['output_toks']),
-                'arrival_time_ns': release_time_ns,
-                'session_id': session_id,
-                'sub_request_index': next_idx,
-            }
-            if self._enable_prefix_caching:
-                req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
-                req_data['output_hash_ids'] = next_sub.get('output_tok_ids', [])
+            req_data = self._make_request_data(
+                next_sub, next_id, release_time_ns, self._enable_prefix_caching,
+                defaults=session_defaults, session_id=session_id, sub_request_index=next_idx,
+            )
             # Insert in sorted position after _pending_idx
             self._insert_pending_sorted(req_data)
             self._request_to_session[next_id] = (session_id, next_idx)
             session['next_index'] = next_idx + 1
         else:
-            # Session complete — all sub-requests have been released
+            # Session complete - all sub-requests have been released
             del self._deferred_sessions[session_id]
 
     def _insert_pending_sorted(self, req_data):
