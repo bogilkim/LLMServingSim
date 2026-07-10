@@ -50,6 +50,17 @@ class Request:
         self._prefix_npu_stats_counted = False
         self._prefix_storage_stats_counted = False
 
+        # Speculative decoding state
+        self.speculative_active = False
+        self.speculative_stage = None  # None, "draft", or "verify"
+        self.speculative_target_tokens = 0
+        self.speculative_draft_tokens = 0
+        self.speculative_draft_kv_tokens = 0
+        self.speculative_verify_tokens = 0
+        self.speculative_accept_tokens = 0
+        self.speculative_first_commit_pending = False
+        self.speculative_iteration = 0
+
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = session_id
         self.sub_request_index = sub_request_index
@@ -84,6 +95,12 @@ class Request:
     def is_prefill(self):
         """Check if request is still in prefill phase (has tokens left to compute)"""
         return self.num_computed_tokens < self.original_input
+
+    def is_speculative_draft(self):
+        return self.speculative_stage == "draft"
+
+    def is_speculative_verify(self):
+        return self.speculative_stage == "verify"
 
 # class that manages batch of astra-sim
 class Batch:

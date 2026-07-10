@@ -12,6 +12,7 @@ from .graph_generator import *
 from .trace_generator import *
 from .logger import print_markup, print_rule
 from .pim_model import *
+from .speculative import SpeculativeAcceptanceModel
 import numpy as np
 
 # class that shedules request of astra-sim
@@ -20,7 +21,10 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
+                 speculative_decoding=False, speculative_role=None,
+                 speculative_draft_length=4, speculative_acceptance_model='constant',
+                 speculative_acceptance_rate=0.8, speculative_acceptance_trace=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -39,6 +43,21 @@ class Scheduler:
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefix_storage = prefix_storage
         self.prioritize_prefill = prioritize_prefill
+
+        self.speculative_decoding = bool(speculative_decoding)
+        self.speculative_role = speculative_role.lower() if isinstance(speculative_role, str) else speculative_role
+        if self.speculative_role not in (None, 'draft', 'target'):
+            raise ValueError(f"Unsupported speculative_role {speculative_role!r}. Expected draft, target, or None.")
+        self.speculative_draft_length = max(1, int(speculative_draft_length)) if self.speculative_decoding else 0
+        self.speculative_acceptance_model = (
+            SpeculativeAcceptanceModel(
+                mode=speculative_acceptance_model,
+                acceptance_rate=speculative_acceptance_rate,
+                trace_path=speculative_acceptance_trace,
+                seed=42,
+            ) if self.speculative_decoding else None
+        )
+
         # lists are sorted in arrival time manner
         self.request = []
         self.inflight = []
@@ -53,10 +72,110 @@ class Scheduler:
     
  
     def schedule(self, current, sys, batch_id=-1):
+        if self.speculative_decoding and self.speculative_role == 'target':
+            batch = self.schedule_speculative_verify(current, sys, batch_id)
+            if batch is not None:
+                return batch
         if self.enable_prefix_caching:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
             return self.schedule_base(current, sys, batch_id)
+
+    def schedule_speculative_verify(self, current, sys, batch_id=-1):
+        if self.speculative_role != 'target':
+            return None
+        if sys == self.start_npu:
+            if len(self.request) != 0 and self.request[0].arrival > current:
+                return None
+            if len(self.inflight) >= self.pp_size:
+                return None
+
+            batch_req = [req for req in self.request
+                         if req.arrival <= current and req.speculative_stage == 'verify']
+            running_reqs = sum(len(b.requests) for b in self.inflight)
+            available_slots = max(0, int(self.max_num_seqs) - running_reqs)
+            batch_len = min(len(batch_req), available_slots)
+            if batch_len == 0:
+                return None
+            batch_req = batch_req[:batch_len]
+
+            scheduled_tokens = {}
+            total_len = 0
+            for req in batch_req:
+                verify_tokens = max(1, int(req.speculative_verify_tokens or (req.speculative_draft_tokens + 1)))
+                req.chunk_len = verify_tokens
+                scheduled_tokens[req.id] = verify_tokens
+                total_len += verify_tokens
+
+            while total_len > self.max_num_batched_tokens:
+                last_req = batch_req[-1]
+                total_len -= scheduled_tokens[last_req.id]
+                del scheduled_tokens[last_req.id]
+                batch_req = batch_req[:-1]
+                batch_len -= 1
+                if batch_len == 0:
+                    return None
+
+            kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+            if not self.memory.is_avail(kv_size, Device.NPU):
+                return None
+
+            for req in batch_req:
+                for i, req_ in enumerate(self.request):
+                    if req_.id == req.id:
+                        del self.request[i]
+                        break
+
+            if kv_size > 0:
+                self.memory.allocate(kv_size, Device.NPU)
+
+            total_len = 0
+            kv_len = 0
+            num_prefill = 0
+            num_decode = 0
+            q_list = []
+            k_list = []
+            prefill_q_list = []
+            prefill_k_list = []
+            decode_k_list = []
+            for req in batch_req:
+                chunk_size = scheduled_tokens[req.id]
+                total_len += chunk_size
+                if req.is_init:
+                    req.set_que_delay(current)
+                q_list.append(chunk_size)
+                prefill_q_list.append(chunk_size)
+                prefill_k_list.append(req.num_computed_tokens)
+                num_prefill += 1
+
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, 0, 0)
+            batch.speculative_stage = 'verify'
+            batch.fired.append(sys)
+            batch.requests.extend(batch_req)
+            self.inflight.append(batch)
+            self.logger.info(
+                "Scheduling speculative verify batch #%d to NPU[%d]",
+                batch.batch_id,
+                sys,
+            )
+            batch.scheduled_tokens = scheduled_tokens
+            return batch
+
+        if len(self.inflight) == 0:
+            return None
+        batch = None
+        for b in self.inflight:
+            if b.batch_id == batch_id:
+                batch = b
+        if batch is None or sys in batch.fired:
+            return None
+        batch.fired.append(sys)
+        self.logger.info(
+            "Scheduling existing batch #%d to NPU[%d]",
+            batch.batch_id,
+            sys,
+        )
+        return batch
 
     def _get_reload_size(self, batch_req, batch_len):
         load_size = 0
@@ -304,6 +423,8 @@ class Scheduler:
             # batch.log()
             # add scheduled_tokens to batch for debugging
             batch.scheduled_tokens = scheduled_tokens
+            if self.speculative_decoding and self.speculative_role == 'draft':
+                batch.speculative_stage = 'draft'
             return batch
         
         # Schedule already batched request
@@ -634,6 +755,8 @@ class Scheduler:
             )
             # print(f"[BATCH DEBUG] Batch: {len(new_batch_req)} reqs, scheduled_tokens: {scheduled_tokens}")
             batch.scheduled_tokens = scheduled_tokens
+            if self.speculative_decoding and self.speculative_role == 'draft':
+                batch.speculative_stage = 'draft'
             # batch.log()
             return batch
         # Schedule already batched request
@@ -661,45 +784,103 @@ class Scheduler:
     def add_done(self, id, sys, finish):
         prompt_t = 0
         gen_t = 0
-        end_reqs = []
+        final_reqs = []
+        transfer_reqs = []
         if len(self.inflight) == 0:
-            return prompt_t, gen_t, end_reqs
+            return prompt_t, gen_t, final_reqs, transfer_reqs
+
         batch = None
+        idx = 0
         # find batch
         id -= 1
-        idx = 0
         for i, b in enumerate(self.inflight):
             if b.batch_id == id:
                 batch = b
                 idx = i
-        # no batch return
-        if batch == None:
-            return prompt_t, gen_t, end_reqs
-        # already done
+        if batch is None:
+            return prompt_t, gen_t, final_reqs, transfer_reqs
         if sys in batch.end:
-            return prompt_t, gen_t, end_reqs
+            return prompt_t, gen_t, final_reqs, transfer_reqs
+
+        batch.end.append(sys)
+        if self.pd_type != "prefill":
+            if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
+                return prompt_t, gen_t, final_reqs, transfer_reqs
         else:
-            # add to done system
-            batch.end.append(sys)
-            # check all npus are done
-            if self.pd_type != "prefill":
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
-                    return prompt_t, gen_t, end_reqs
-            else:
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus * 2 - 1) not in batch.end:
-                    return prompt_t, gen_t, end_reqs
+            if self.start_npu not in batch.end or (self.start_npu + self.num_npus * 2 - 1) not in batch.end:
+                return prompt_t, gen_t, final_reqs, transfer_reqs
+
         self.logger.info(
             "Batch #%d is done",
             batch.batch_id,
         )
-                
+
         pool = []
+        batch_stage = getattr(batch, 'speculative_stage', None)
+
         for req in batch.requests:
-            # For chunked prefill, use computed tokens to determine prefill vs decode
-            # Use is_prefill() method which checks num_computed_tokens < original_input
+            # Speculative draft step: one decode token on the draft model.
+            if self.speculative_decoding and batch_stage == 'draft' and req.speculative_stage == 'draft':
+                req.num_computed_tokens += 1
+                draft_generated = req.num_computed_tokens - req.speculative_target_tokens
+                if draft_generated >= req.speculative_draft_tokens:
+                    req.speculative_draft_kv_tokens = req.num_computed_tokens
+                    req.speculative_stage = 'verify'
+                    req.speculative_verify_tokens = req.speculative_draft_tokens + 1
+                    req.num_computed_tokens = req.speculative_target_tokens
+                    transfer_reqs.append(req)
+                else:
+                    pool.append(req)
+                continue
+
+            # Speculative verification step: mini-prefill on the target model.
+            if self.speculative_decoding and req.speculative_stage == 'verify':
+                base_tokens = req.speculative_target_tokens
+                verify_tokens = max(1, int(req.speculative_verify_tokens or (req.speculative_draft_tokens + 1)))
+                accepted = self.speculative_acceptance_model.sample(
+                    request=req,
+                    iteration=req.speculative_iteration,
+                    draft_tokens=req.speculative_draft_tokens,
+                )
+                accepted = min(max(0, accepted), max(0, req.output - base_tokens - 1))
+                committed = base_tokens + accepted + 1
+                req.speculative_accept_tokens = accepted
+                gen_t += accepted + 1
+
+                # Roll the target KV cache back from the full verify window to the
+                # accepted prefix plus the target token.
+                self.memory.adjust_tokens(base_tokens + verify_tokens, committed, Device.NPU)
+                req.num_computed_tokens = committed
+                req.speculative_target_tokens = committed
+
+                if req.speculative_first_commit_pending:
+                    req.set_ttft(finish)
+                    req.speculative_first_commit_pending = False
+                    req.is_init = False
+
+                req.speculative_iteration += 1
+                if committed >= req.output:
+                    self.logger.info("Request #%d is done", req.id)
+                    if self.enable_prefix_caching:
+                        self.memory.cache_finished_req(req, Device.NPU)
+                        if self.prefix_storage is not None:
+                            self.memory.cache_finished_req(req, Device.CPU)
+                    else:
+                        kv_size = self.memory.get_evict_kv(req)
+                        self.memory.free(kv_size, Device.NPU)
+                    req.add_latency(finish)
+                    req.speculative_stage = None
+                    self.done.append(req)
+                    final_reqs.append(req)
+                else:
+                    req.speculative_stage = 'draft'
+                    remaining = max(1, req.output - committed - 1)
+                    req.speculative_draft_tokens = min(self.speculative_draft_length, remaining)
+                    transfer_reqs.append(req)
+                continue
+
             is_prefill_req = req.is_prefill()
-            
-            # change phase
+
             if is_prefill_req:
                 # Get chunk_len from scheduling step
                 chunk_len = req.chunk_len if req.chunk_len > 0 else (req.original_input - req.num_computed_tokens)
@@ -709,9 +890,27 @@ class Scheduler:
                 # Update num_computed_tokens
                 req.num_computed_tokens += chunk_len
                 req.chunk_len = 0  # Reset for next step
-                
+
                 # Check if prefill is complete
                 if req.num_computed_tokens >= req.original_input:
+                    if self.speculative_decoding and self.pd_type == 'prefill':
+                        prompt_t += chunk_len + req.prefix_cache_hit
+                        req.is_init = False
+                        req.speculative_active = True
+                        req.speculative_stage = 'draft'
+                        req.speculative_target_tokens = req.num_computed_tokens
+                        req.speculative_draft_tokens = min(
+                            self.speculative_draft_length,
+                            max(1, req.output - req.num_computed_tokens - 1),
+                        )
+                        req.speculative_draft_kv_tokens = 0
+                        req.speculative_verify_tokens = 0
+                        req.speculative_accept_tokens = 0
+                        req.speculative_first_commit_pending = True
+                        req.speculative_iteration = 0
+                        transfer_reqs.append(req)
+                        continue
+
                     # Update prefix cache before clearing is_init (for stats tracking)
                     if self.enable_prefix_caching:
                         self.memory.cache_unfinished_req(req, Device.NPU)
@@ -721,13 +920,12 @@ class Scheduler:
                     # Include prefix cache hit tokens in prompt throughput
                     prompt_t += chunk_len + req.prefix_cache_hit
                     req.set_ttft(finish)
-                    
+
                     if self.pd_type == "prefill":
                         # Prefill instance: send to decode instance
                         self.logger.info("Request #%d is prefill done", req.id)
                         self.logger.info("Request #%d is sent to decode instance", req.id)
-                        # req.num_computed_tokens += 1  # First decode token was generated
-                        
+
                         # remove kv cache here
                         if self.enable_prefix_caching:
                             self.memory.unlock_prefix(req, Device.NPU)
@@ -735,21 +933,14 @@ class Scheduler:
                             kv_size = self.memory.get_evict_kv(req)
                             self.memory.free(kv_size, Device.NPU)
 
-                        end_reqs.append(req)
+                        transfer_reqs.append(req)
                         continue
                     else:
                         # Non-PD: prefill complete, first output token generated
-                        # The last prefill token passing through lm_head generates the first output
                         gen_t += 1
-                        # req.num_computed_tokens += 1  # Count the first generated token
-                        # req.set_ttft(finish)
-                        # pool.append(req)
-                        # continue
                 else:
-                    # Prefill not complete, return to pool for next chunk
                     prompt_t += chunk_len
-                    # pool.append(req)
-                    # continue
+
             else:
                 # Decode phase
                 if req.is_init:
@@ -773,16 +964,27 @@ class Scheduler:
                 req.add_itl(finish)
                 req.num_computed_tokens += 1
 
-            # Update computed tokens for decode
-            # req.num_computed_tokens += 1
+                # Speculative draft steps are counted as internal model work, not
+                # as committed output tokens. Only hand off after the full draft
+                # quota has been generated.
+                if self.speculative_decoding and req.speculative_stage == 'draft':
+                    draft_generated = req.num_computed_tokens - req.speculative_target_tokens
+                    if draft_generated >= req.speculative_draft_tokens:
+                        req.speculative_draft_kv_tokens = req.num_computed_tokens
+                        req.speculative_stage = 'verify'
+                        req.speculative_verify_tokens = req.speculative_draft_tokens + 1
+                        req.num_computed_tokens = req.speculative_target_tokens
+                        transfer_reqs.append(req)
+                        continue
+                    pool.append(req)
+                    continue
 
             # check done
             if req.output <= req.num_computed_tokens + 1:
-                # print("Request #{} is done".format(req.id))
                 self.logger.info("Request #%d is done", req.id)
                 # remove kv cache here
                 if self.enable_prefix_caching:
-                    self.memory.cache_finished_req(req, Device.NPU) # insert happens here
+                    self.memory.cache_finished_req(req, Device.NPU)
                     if self.prefix_storage is not None:
                         self.memory.cache_finished_req(req, Device.CPU)
                 else:
@@ -790,17 +992,15 @@ class Scheduler:
                     self.memory.free(kv_size, Device.NPU)
                 req.add_latency(finish)
                 self.done.append(req)
-                end_reqs.append(req)
-
-            # return to pool
+                final_reqs.append(req)
             else:
-                # print("Request #{} is not finished => go to pool".format(req.id))
-                # Update prefix cache after chunk completion (moved from schedule_with_prefix())
+                # return to pool
                 if self.enable_prefix_caching:
                     self.memory.cache_unfinished_req(req, Device.NPU)
                     if self.prefix_storage is not None:
                         self.memory.cache_unfinished_req(req, self.prefix_storage)
                 pool.append(req)
+
         # return to request pool, both are already sorted with arrival_time
         if self.prioritize_prefill:
             self.request = self._merge_by_arrival_id(pool, self.request)
@@ -809,9 +1009,7 @@ class Scheduler:
         del self.inflight[idx]
         del batch
 
-        return prompt_t, gen_t, end_reqs
-    
-
+        return prompt_t, gen_t, final_reqs, transfer_reqs
     ##### Helper Functions ######
     # get new batch id
     def get_batch_id(self):
@@ -820,7 +1018,16 @@ class Scheduler:
 
     # add a request
     def add_request(self, req, is_init=True, session_id=None, sub_request_index=None):
-        new_req = Request(*(req), is_init=is_init, session_id=session_id, sub_request_index=sub_request_index)
+        if isinstance(req, Request):
+            new_req = req
+            new_req.model = self.model
+            new_req.instance_id = self.instance_id
+            if session_id is not None:
+                new_req.session_id = session_id
+            if sub_request_index is not None:
+                new_req.sub_request_index = sub_request_index
+        else:
+            new_req = Request(*(req), is_init=is_init, session_id=session_id, sub_request_index=sub_request_index)
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
         return
@@ -828,8 +1035,14 @@ class Scheduler:
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
         req.instance_id = self.instance_id
+        req.model = self.model
         self.request.append(req)
-        if self.enable_prefix_caching:
+        if self.speculative_decoding and req.speculative_stage == 'draft':
+            current_tokens = int(getattr(req, 'speculative_draft_kv_tokens', 0) or 0)
+            new_tokens = int(req.num_computed_tokens)
+            self.memory.adjust_tokens(current_tokens, new_tokens, Device.NPU)
+            req.speculative_draft_kv_tokens = new_tokens
+        elif self.enable_prefix_caching:
             self.memory.prefix_match(req)
             kv_size = self.memory.get_evict_kv(req)
             evict_size = max(0, kv_size - self.memory.avail_size(Device.NPU))

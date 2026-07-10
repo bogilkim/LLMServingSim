@@ -158,6 +158,11 @@ class MemoryModel():
         num_blocks = (req.num_computed_tokens + self.block_size - 1) // self.block_size
         return self.get_kv(num_blocks * self.block_size)
 
+    def get_total_kv_tokens(self, tokens):
+        """Return the KV footprint for a raw token count."""
+        num_blocks = (max(int(tokens), 0) + self.block_size - 1) // self.block_size
+        return self.get_kv(num_blocks * self.block_size)
+
     # get size of kv block that should be 'added'. including new init requests
     # also checks evicted request and include its kv cache
     # scheduled_tokens: dict mapping request id to number of tokens scheduled this step
@@ -171,27 +176,27 @@ class MemoryModel():
         block_kv_size = 0
         for i in range(batch_len):
             req = batch_req[i]
-            if req.evict or req.is_prefill():
-                # Prefill and reloaded decode requests may allocate newly
-                # computed blocks. Existing evicted KV is reloaded separately
-                # by Scheduler.load_size.
+            is_spec_verify = getattr(req, "speculative_stage", None) == "verify"
+            if req.evict or req.is_prefill() or is_spec_verify:
+                # Prefill, verify, and reloaded decode requests may allocate
+                # newly computed blocks. Existing evicted KV is reloaded
+                # separately by Scheduler.load_size.
                 hit = req.npu_cache_hit if self.enable_prefix_caching else 0
-                
+
                 if scheduled_tokens and req.id in scheduled_tokens:
                     tokens_this_step = scheduled_tokens[req.id]
                 else:
                     raise RuntimeError("[MemoryModel] [node_id={self.node_id},inst={self.instance_id}]: scheduled_tokens cannot be None")
-                
+
                 # vLLM-style cumulative block allocation
                 computed_before = req.num_computed_tokens
-                
+
                 total_after = computed_before + tokens_this_step
-                
+
                 # Calculate blocks needed (cumulative)
                 blocks_after = (total_after + self.block_size - 1) // self.block_size
                 blocks_before = (computed_before + self.block_size - 1) // self.block_size if computed_before > 0 else 0
-                
-                
+
                 new_blocks = max(0, blocks_after - blocks_before)
                 block_kv_size += self.get_kv(new_blocks * self.block_size)
                 # print("[DEBUG] hit : {} | tokens_this_step : {} | computed_before : {} | total_after : {} | new_blocks : {} | block_kv_size : {}".format(
@@ -217,6 +222,15 @@ class MemoryModel():
         num_blocks = (needed + self.block_size - 1) // self.block_size
         evict_size += self.get_kv(num_blocks * self.block_size)
         return evict_size
+
+    def adjust_tokens(self, current_tokens, new_tokens, device=Device.NPU):
+        """Adjust a request's KV footprint from current_tokens to new_tokens."""
+        current_size = self.get_total_kv_tokens(current_tokens)
+        new_size = self.get_total_kv_tokens(new_tokens)
+        if new_size > current_size:
+            self.allocate(new_size - current_size, device)
+        elif new_size < current_size:
+            self.free(current_size - new_size, device)
 
     def free_weight(self):
         if self.npu_used - self.weight < 0:
