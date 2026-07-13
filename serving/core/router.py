@@ -397,3 +397,40 @@ class Router:
         for req in requests:
             instance_id = self._select_instance(self.decode_schedulers, "decode")
             self.decode_schedulers[instance_id].add_decode(req)
+
+    def transfer_speculative_requests(self, requests):
+        for req in requests:
+            stage = getattr(req, 'speculative_stage', None)
+            if stage == 'verify':
+                candidates = self.decode_schedulers
+                pinned = getattr(req, 'speculative_target_instance_id', None)
+                role = 'decode'
+            elif stage == 'draft':
+                candidates = self.prefill_schedulers
+                pinned = getattr(req, 'speculative_draft_instance_id', None)
+                role = 'prefill'
+            else:
+                self.transfer_prefill_request([req])
+                continue
+
+            if pinned is not None:
+                pinned = int(pinned)
+                if pinned < 0 or pinned >= len(self.schedulers):
+                    raise IndexError(
+                        f'Request {req.id} requested speculative instance {pinned}, '
+                        'but that instance id is out of range.'
+                    )
+                sched = self.schedulers[pinned]
+                if sched not in candidates:
+                    raise ValueError(
+                        f'Request {req.id} requested speculative instance {pinned}, '
+                        f'but it is not a {role} scheduler.'
+                    )
+            else:
+                sched = candidates[self._select_instance(candidates, role)]
+
+            if stage == 'verify':
+                req.speculative_target_instance_id = sched.instance_id
+            else:
+                req.speculative_draft_instance_id = sched.instance_id
+            sched.add_decode(req)

@@ -76,6 +76,8 @@ class Scheduler:
             batch = self.schedule_speculative_verify(current, sys, batch_id)
             if batch is not None:
                 return batch
+            if any(req.arrival <= current and req.speculative_stage == 'verify' for req in self.request):
+                return None
         if self.enable_prefix_caching:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
@@ -852,6 +854,7 @@ class Scheduler:
                 self.memory.adjust_tokens(base_tokens + verify_tokens, committed, Device.NPU)
                 req.num_computed_tokens = committed
                 req.speculative_target_tokens = committed
+                req.speculative_target_kv_tokens = committed
 
                 if req.speculative_first_commit_pending:
                     req.set_ttft(finish)
@@ -908,7 +911,8 @@ class Scheduler:
                         req.speculative_accept_tokens = 0
                         req.speculative_first_commit_pending = True
                         req.speculative_iteration = 0
-                        transfer_reqs.append(req)
+                        req.speculative_draft_instance_id = self.instance_id
+                        pool.append(req)
                         continue
 
                     # Update prefix cache before clearing is_init (for stats tracking)
@@ -960,14 +964,9 @@ class Scheduler:
                     req.set_ttft(finish)
                     # Full prefix hit: count all cached tokens as prompt throughput
                     prompt_t += req.prefix_cache_hit
-                gen_t += 1
-                req.add_itl(finish)
-                req.num_computed_tokens += 1
-
-                # Speculative draft steps are counted as internal model work, not
-                # as committed output tokens. Only hand off after the full draft
-                # quota has been generated.
                 if self.speculative_decoding and req.speculative_stage == 'draft':
+                    # Draft tokens are internal speculative work, not committed output.
+                    req.num_computed_tokens += 1
                     draft_generated = req.num_computed_tokens - req.speculative_target_tokens
                     if draft_generated >= req.speculative_draft_tokens:
                         req.speculative_draft_kv_tokens = req.num_computed_tokens
@@ -978,6 +977,9 @@ class Scheduler:
                         continue
                     pool.append(req)
                     continue
+                gen_t += 1
+                req.add_itl(finish)
+                req.num_computed_tokens += 1
 
             # check done
             if req.output <= req.num_computed_tokens + 1:
@@ -1042,6 +1044,11 @@ class Scheduler:
             new_tokens = int(req.num_computed_tokens)
             self.memory.adjust_tokens(current_tokens, new_tokens, Device.NPU)
             req.speculative_draft_kv_tokens = new_tokens
+        elif self.speculative_decoding and req.speculative_stage == 'verify':
+            current_tokens = int(req.speculative_target_kv_tokens or 0)
+            new_tokens = int(req.num_computed_tokens)
+            self.memory.adjust_tokens(current_tokens, new_tokens, Device.NPU)
+            req.speculative_target_kv_tokens = new_tokens
         elif self.enable_prefix_caching:
             self.memory.prefix_match(req)
             kv_size = self.memory.get_evict_kv(req)
@@ -1052,6 +1059,14 @@ class Scheduler:
         else:
             kv_size = self.memory.get_total_kv(req)
             self.memory.allocate(kv_size, Device.NPU)
+
+    def release_speculative_draft(self, req):
+        if not self.speculative_decoding:
+            return
+        current_tokens = int(req.speculative_draft_kv_tokens or 0)
+        if current_tokens > 0:
+            self.memory.adjust_tokens(current_tokens, 0, Device.NPU)
+        req.speculative_draft_kv_tokens = 0
     
     # get first request's arrival time
     def get_first_arrival_time(self):

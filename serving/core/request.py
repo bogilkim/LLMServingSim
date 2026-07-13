@@ -56,10 +56,13 @@ class Request:
         self.speculative_target_tokens = 0
         self.speculative_draft_tokens = 0
         self.speculative_draft_kv_tokens = 0
+        self.speculative_target_kv_tokens = 0
         self.speculative_verify_tokens = 0
         self.speculative_accept_tokens = 0
         self.speculative_first_commit_pending = False
         self.speculative_iteration = 0
+        self.speculative_draft_instance_id = None
+        self.speculative_target_instance_id = None
 
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = session_id

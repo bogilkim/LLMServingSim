@@ -186,6 +186,17 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
+            "speculative_decoding": instance.get(
+                "speculative_decoding", args.speculative_decoding),
+            "speculative_role": instance.get("speculative_role"),
+            "speculative_draft_length": instance.get(
+                "speculative_draft_length", args.speculative_draft_length),
+            "speculative_acceptance_model": instance.get(
+                "speculative_acceptance_model", args.speculative_acceptance_model),
+            "speculative_acceptance_rate": instance.get(
+                "speculative_acceptance_rate", args.speculative_acceptance_rate),
+            "speculative_acceptance_trace": instance.get(
+                "speculative_acceptance_trace", args.speculative_acceptance_trace),
         })
     return runtime_configs
 
@@ -291,6 +302,17 @@ def main():
                         help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--speculative-decoding', action=argparse.BooleanOptionalAction, default=False,
+                        help='enable speculative decoding with separate draft and target scheduler roles')
+    parser.add_argument('--speculative-draft-length', type=int, default=4,
+                        help='number of draft tokens to generate before verification')
+    parser.add_argument('--speculative-acceptance-model', type=str, choices=['constant', 'random', 'trace'],
+                        default='constant',
+                        help='speculative acceptance model: constant, random, or trace replay')
+    parser.add_argument('--speculative-acceptance-rate', type=float, default=0.8,
+                        help='acceptance rate for constant/random speculative acceptance models')
+    parser.add_argument('--speculative-acceptance-trace', type=str, default=None,
+                        help='path to acceptance trace CSV/JSONL for trace replay mode')
 
     args = parser.parse_args()
     
@@ -447,6 +469,12 @@ def main():
         # Make scheduler for each instance
 
         inst_cfg = instance_runtime_configs[instance_id]
+        speculative_role = inst_cfg.get("speculative_role")
+        if inst_cfg.get("speculative_decoding") and speculative_role is None:
+            if instance.get("pd_type") == "prefill":
+                speculative_role = "draft"
+            elif instance.get("pd_type") == "decode":
+                speculative_role = "target"
 
         schedulers.append(Scheduler(
             instance["model_name"], instance["node_id"], instance_id,
@@ -461,6 +489,12 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            speculative_decoding=inst_cfg["speculative_decoding"],
+            speculative_role=speculative_role,
+            speculative_draft_length=inst_cfg["speculative_draft_length"],
+            speculative_acceptance_model=inst_cfg["speculative_acceptance_model"],
+            speculative_acceptance_rate=inst_cfg["speculative_acceptance_rate"],
+            speculative_acceptance_trace=inst_cfg["speculative_acceptance_trace"],
         ))
 
     # Controller for astra-sim process communication
@@ -578,23 +612,30 @@ def main():
             waiting_request[instance_id] = True
 
         # check request is done
-        prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
+        prompt_t, gen_t, final_reqs, transfer_reqs = schedulers[instance_id].add_done(id, sys, current)
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
         gen_th += gen_t
         total_gen += gen_t
-        # count only finished requests
-        req_cnt += len(finished_reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+        req_cnt += len(final_reqs)
 
         # Notify router of completed requests for dependency chain release
         if instances[instance_id]["pd_type"] != "prefill":
-            for req in finished_reqs:
+            for req in final_reqs:
                 router.notify_request_completed(req.id, current)
 
+        for req in final_reqs:
+            draft_inst = getattr(req, "speculative_draft_instance_id", None)
+            if draft_inst is not None and draft_inst != instance_id:
+                schedulers[draft_inst].release_speculative_draft(req)
+
         # Add prefill ended requests to decode instance
-        if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
-            router.transfer_prefill_request(finished_reqs)
+        if instances[instance_id]["pd_type"] == "prefill" and len(final_reqs) > 0:
+            router.transfer_prefill_request(final_reqs)
+
+        if transfer_reqs:
+            router.transfer_speculative_requests(transfer_reqs)
 
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)
