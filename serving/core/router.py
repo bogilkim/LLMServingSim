@@ -17,6 +17,10 @@ class Router:
         self.prefill_schedulers = [s for s in schedulers if s.pd_type != "decode"]
         self.prefill_instances = len(self.prefill_schedulers)
         self.decode_schedulers = [s for s in schedulers if s.pd_type == "decode"]
+        self.speculative_draft_schedulers = [
+            s for s in schedulers if s.speculative_decoding and s.speculative_role == 'draft']
+        self.speculative_target_schedulers = [
+            s for s in schedulers if s.speculative_decoding and s.speculative_role == 'target']
         self.decode_instances = len(self.decode_schedulers)
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
@@ -137,6 +141,11 @@ class Router:
 
     def _select_scheduler_for_request(self, req_data):
         route_to = self._normalize_route_to(req_data.get('route_to'))
+        if self.speculative_draft_schedulers and self.speculative_target_schedulers:
+            # The workload's model_name describes the served target model;
+            # speculative admission always begins on a draft-role instance.
+            candidates = self.speculative_draft_schedulers
+            return candidates[self._select_instance(candidates, 'prefill')]
         candidates = self.prefill_schedulers if route_to == 'prefill' else self.decode_schedulers
         if not candidates:
             raise LookupError(
@@ -401,18 +410,20 @@ class Router:
     def transfer_speculative_requests(self, requests):
         for req in requests:
             stage = getattr(req, 'speculative_stage', None)
-            if stage == 'verify':
-                candidates = self.decode_schedulers
+            if stage in ('verify', 'target_prefill'):
+                candidates = self.speculative_target_schedulers
                 pinned = getattr(req, 'speculative_target_instance_id', None)
-                role = 'decode'
-            elif stage == 'draft':
-                candidates = self.prefill_schedulers
+                role = 'target'
+            elif stage in ('draft_prefill', 'draft', 'draft_sync'):
+                candidates = self.speculative_draft_schedulers
                 pinned = getattr(req, 'speculative_draft_instance_id', None)
-                role = 'prefill'
+                role = 'draft'
             else:
                 self.transfer_prefill_request([req])
                 continue
 
+            if not candidates:
+                raise LookupError(f'No speculative {role} scheduler is configured.')
             if pinned is not None:
                 pinned = int(pinned)
                 if pinned < 0 or pinned >= len(self.schedulers):
@@ -429,7 +440,7 @@ class Router:
             else:
                 sched = candidates[self._select_instance(candidates, role)]
 
-            if stage == 'verify':
+            if stage in ('verify', 'target_prefill'):
                 req.speculative_target_instance_id = sched.instance_id
             else:
                 req.speculative_draft_instance_id = sched.instance_id

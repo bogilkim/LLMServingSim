@@ -8,6 +8,8 @@ class SpeculativeAcceptanceModel:
     def __init__(self, mode='constant', acceptance_rate=0.8, trace_path=None, seed=42):
         self.mode = (mode or 'constant').lower()
         self.acceptance_rate = float(acceptance_rate)
+        if not 0.0 <= self.acceptance_rate <= 1.0:
+            raise ValueError('speculative acceptance rate must be between 0 and 1')
         self.trace_path = trace_path
         self._rnd = random.Random(seed)
         self._trace = defaultdict(list)
@@ -22,6 +24,8 @@ class SpeculativeAcceptanceModel:
             if not trace_path:
                 raise ValueError('speculative acceptance trace mode requires trace_path')
             self._load_trace(trace_path)
+            if not self._trace:
+                raise ValueError(f'speculative acceptance trace is empty: {trace_path}')
 
     def _load_trace(self, path):
         if path.endswith('.jsonl'):
@@ -52,12 +56,15 @@ class SpeculativeAcceptanceModel:
     def _trace_sample(self, request_id, iteration, draft_tokens):
         key = (None if request_id is None else int(request_id), int(iteration))
         values = self._trace.get(key)
+        selected_key = key
         if not values:
-            values = self._trace.get((None, int(iteration)), [])
+            selected_key = (None, int(iteration))
+            values = self._trace.get(selected_key, [])
         if not values:
-            return min(draft_tokens, 0)
-        idx = self._trace_pos[key]
-        self._trace_pos[key] = idx + 1
+            raise KeyError(
+                f'No acceptance trace entry for request {request_id}, iteration {iteration}')
+        idx = self._trace_pos[selected_key]
+        self._trace_pos[selected_key] = idx + 1
         if idx >= len(values):
             idx = len(values) - 1
         return min(draft_tokens, max(0, int(values[idx])))

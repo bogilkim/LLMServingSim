@@ -200,6 +200,40 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
         })
     return runtime_configs
 
+def _resolve_speculative_roles(instances, runtime_configs):
+    enabled = [i for i, cfg in enumerate(runtime_configs) if cfg["speculative_decoding"]]
+    for i in enabled:
+        role = runtime_configs[i].get("speculative_role")
+        if role is None:
+            pd_type = instances[i].get("pd_type")
+            if pd_type == "prefill":
+                role = "draft"
+            elif pd_type == "decode":
+                role = "target"
+        runtime_configs[i]["speculative_role"] = role
+
+    missing = [i for i in enabled if runtime_configs[i]["speculative_role"] is None]
+    assigned = {runtime_configs[i]["speculative_role"] for i in enabled} - {None}
+    if len(missing) == 2 and not assigned:
+        runtime_configs[missing[0]]["speculative_role"] = "draft"
+        runtime_configs[missing[1]]["speculative_role"] = "target"
+    elif len(missing) == 1 and assigned in ({"draft"}, {"target"}):
+        runtime_configs[missing[0]]["speculative_role"] = (
+            "target" if "draft" in assigned else "draft")
+    elif missing:
+        raise ValueError("Set speculative_role to draft or target on each speculative instance.")
+
+    roles = {runtime_configs[i]["speculative_role"] for i in enabled}
+    if enabled and roles != {"draft", "target"}:
+        raise ValueError("Speculative decoding requires at least one draft and one target instance.")
+
+
+def _resolve_trace_paths(runtime_configs, launch_cwd):
+    for cfg in runtime_configs:
+        path = cfg.get("speculative_acceptance_trace")
+        if path and not os.path.isabs(path):
+            cfg["speculative_acceptance_trace"] = os.path.abspath(os.path.join(launch_cwd, path))
+
 
 def main():
     # ----------------------------------------------------------------------------------------------
@@ -367,6 +401,8 @@ def main():
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
+    _resolve_speculative_roles(instances, instance_runtime_configs)
+    _resolve_trace_paths(instance_runtime_configs, cwd)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration

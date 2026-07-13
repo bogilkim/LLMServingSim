@@ -52,7 +52,8 @@ class Request:
 
         # Speculative decoding state
         self.speculative_active = False
-        self.speculative_stage = None  # None, "draft", or "verify"
+        # draft_prefill -> target_prefill -> draft -> verify -> draft_sync
+        self.speculative_stage = None
         self.speculative_target_tokens = 0
         self.speculative_draft_tokens = 0
         self.speculative_draft_kv_tokens = 0
@@ -100,7 +101,7 @@ class Request:
         return self.num_computed_tokens < self.original_input
 
     def is_speculative_draft(self):
-        return self.speculative_stage == "draft"
+        return self.speculative_stage in ("draft_prefill", "draft", "draft_sync")
 
     def is_speculative_verify(self):
         return self.speculative_stage == "verify"

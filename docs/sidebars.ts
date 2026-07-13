@@ -63,6 +63,7 @@ const sidebars: SidebarsConfig = {
           items: [
             'examples/advanced/power-modeling',
             'examples/advanced/sub-batch-interleaving',
+            'examples/advanced/speculative-decoding',
           ],
         },
       ],
