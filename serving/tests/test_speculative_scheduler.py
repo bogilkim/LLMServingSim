@@ -63,12 +63,13 @@ def _scheduler(role):
     return scheduler
 
 
-def _batch(request, stage=None):
+def _batch(request, stage=None, scheduled_tokens=None):
     return types.SimpleNamespace(
         batch_id=0,
         end=[],
         requests=[request],
         speculative_stage=stage,
+        scheduled_tokens=scheduled_tokens,
     )
 
 
@@ -124,6 +125,33 @@ class SpeculativeSchedulerTest(unittest.TestCase):
         self.assertEqual(transfer, [])
         self.assertEqual(request.speculative_stage, 'draft')
         self.assertEqual(request.speculative_draft_kv_tokens, 13)
+
+    def test_eagle3_iteration_commits_and_requeues(self):
+        scheduler = _scheduler('eagle3')
+        request = Request(0, 'target', 10, 30, 0, 0)
+        request.speculative_active = True
+        request.speculative_stage = 'eagle3'
+        request.speculative_target_tokens = 10
+        request.speculative_target_kv_tokens = 15
+        request.speculative_draft_tokens = 4
+        request.speculative_verify_tokens = 5
+        request.speculative_first_commit_pending = True
+        request.num_computed_tokens = 10
+        scheduler.inflight = [
+            _batch(request, 'eagle3', scheduled_tokens={request.id: 5})
+        ]
+
+        _, generated, final, transfer = scheduler.add_done(1, 0, 100)
+
+        self.assertEqual(generated, 3)
+        self.assertEqual(final, [])
+        self.assertEqual(transfer, [])
+        self.assertEqual(scheduler.memory.adjustments, [(15, 13)])
+        self.assertEqual(request.speculative_target_tokens, 13)
+        self.assertEqual(request.speculative_draft_tokens, 4)
+        self.assertEqual(request.speculative_stage, 'eagle3')
+        self.assertIn(request, scheduler.request)
+
 
 
 if __name__ == '__main__':

@@ -211,3 +211,116 @@ def assemble_scheduler_output(shot: Shot, model_runner):
         free_encoder_mm_hashes=[],
     )
     return scheduler_output, set(req_ids)
+
+
+def assemble_eagle3_seed_output(
+    batch_size: int,
+    kv_len: int,
+    num_speculative_tokens: int,
+    model_runner,
+    request_prefix: str,
+    finished_req_ids=(),
+):
+    """Create the untimed one-token step that seeds native EAGLE3 drafts."""
+    from vllm import SamplingParams
+    from vllm.v1.core.sched.output import (
+        CachedRequestData,
+        NewRequestData,
+        SchedulerOutput,
+    )
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        ignore_eos=True,
+        max_tokens=num_speculative_tokens + 2,
+    )
+    block_tables = model_runner.input_batch.block_table.block_tables
+    block_sizes = [
+        bt.block_size * bt.blocks_per_kv_block
+        for bt in block_tables
+    ]
+    block_cursor = [0] * len(block_sizes)
+    scheduled = []
+    req_ids = []
+
+    for idx in range(batch_size):
+        req_id = f"{request_prefix}_{idx}"
+        req_ids.append(req_id)
+        # The timed verification starts with exactly kv_len target KV tokens.
+        # This untimed step computes the final seed token that creates them.
+        reserved_len = kv_len + num_speculative_tokens + 1
+        group_block_ids = []
+        for group, block_size in enumerate(block_sizes):
+            num_blocks = max(1, math.ceil(reserved_len / block_size))
+            ids = list(
+                range(block_cursor[group], block_cursor[group] + num_blocks)
+            )
+            block_cursor[group] += num_blocks
+            group_block_ids.append(ids)
+
+        scheduled.append(
+            NewRequestData(
+                req_id=req_id,
+                prompt_token_ids=[1] * kv_len,
+                mm_features=[],
+                sampling_params=sampling_params,
+                pooling_params=None,
+                block_ids=tuple(group_block_ids),
+                num_computed_tokens=kv_len - 1,
+                lora_request=None,
+            )
+        )
+
+    return SchedulerOutput(
+        scheduled_new_reqs=scheduled,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+        total_num_scheduled_tokens=batch_size,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0] * len(block_sizes),
+        finished_req_ids=set(finished_req_ids),
+        free_encoder_mm_hashes=[],
+    ), req_ids
+
+
+def assemble_eagle3_verify_output(
+    req_ids: list[str],
+    kv_len: int,
+    draft_token_ids: dict[str, list[int]],
+    model_runner,
+):
+    """Create one native target-verification step for already seeded drafts."""
+    from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+
+    drafts = {
+        req_id: list(draft_token_ids[req_id])
+        for req_id in req_ids
+    }
+    scheduled_tokens = {
+        req_id: len(tokens) + 1
+        for req_id, tokens in drafts.items()
+    }
+    num_kv_groups = len(model_runner.input_batch.block_table.block_tables)
+
+    cached = CachedRequestData(
+        req_ids=req_ids,
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None] * len(req_ids),
+        num_computed_tokens=[kv_len] * len(req_ids),
+        num_output_tokens=[1] * len(req_ids),
+    )
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached,
+        num_scheduled_tokens=scheduled_tokens,
+        total_num_scheduled_tokens=sum(scheduled_tokens.values()),
+        scheduled_spec_decode_tokens=drafts,
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0] * num_kv_groups,
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )

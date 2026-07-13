@@ -21,6 +21,7 @@ profiler/perf/<HARDWARE>/<MODEL>/<variant>/
     ├── per_sequence.csv
     ├── attention.csv
     ├── moe.csv                   # MoE models only
+    ├── eagle3.csv                # native EAGLE3 runs only (tp1)
     ├── skew.csv                  # skew-enabled runs only
     └── skew_fit.csv              # skew-enabled runs only
 ```
@@ -139,6 +140,27 @@ Simulator: **2D linear interpolation** on `(tokens, activated_experts)`.
 Profiled at **TP=1** only, increasing TP doesn't change the
 per-rank expert kernel. The simulator handles `ep_size` by adjusting
 expert-to-rank assignment, not by re-profiling.
+
+## `eagle3.csv` (EAGLE3 runs only)
+
+```text
+batch_size,kv_len,num_speculative_tokens,time_us
+1,128,4,842.1
+4,128,4,2174.6
+4,256,4,2310.8
+```
+
+| Column | Meaning |
+| --- | --- |
+| `batch_size` | Requests in the native EAGLE3 iteration |
+| `kv_len` | Mean committed target KV length |
+| `num_speculative_tokens` | Proposal length `k` configured on the vLLM engine |
+| `time_us` | Native target verify + sample + next EAGLE proposal latency |
+
+The EAGLE3 command writes this table under `tp1/` and merges an
+`eagle3_profile` block into `meta.yaml`. The simulator requires an exact
+match on `num_speculative_tokens`, interpolates over batch size and KV
+length, and emits the measured pipeline as one aggregate compute operation.
 
 ## `skew.csv` (skew-enabled runs)
 

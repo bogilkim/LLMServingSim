@@ -5,6 +5,9 @@ Two subcommands:
     profile <model> --hardware <hw> [options]
         Full sweep: every TP × every category.
 
+    eagle3 <model> --hardware <hw> --eagle-model <draft> [options]
+        Native EAGLE3 verification and proposal sweep.
+
     slice <model> --hardware <hw> --tp-refresh N --group G [options]
         Refresh one (tp, category) pair.
 
@@ -52,6 +55,7 @@ from profiler.core.config import (
     read_model_config,
     resolve_architecture_by_model_type,
 )
+from profiler.core.eagle3 import run_eagle3
 from profiler.core.runner import run_full, run_slice
 
 
@@ -305,6 +309,15 @@ def _parse_tp(tp_str: str) -> list[int]:
     return tps
 
 
+def _parse_positive_int_list(value: str, flag: str) -> list[int]:
+    parsed = sorted({int(x.strip()) for x in value.split(",") if x.strip()})
+    if not parsed:
+        raise ValueError(f"{flag} must contain at least one value")
+    if parsed[0] < 1:
+        raise ValueError(f"{flag} values must be positive")
+    return parsed
+
+
 def _build_profile_args(
     ns: argparse.Namespace,
     hf_id: str,
@@ -334,6 +347,20 @@ def _build_profile_args(
         force=getattr(ns, "force", False),
         hf_overrides=None,
         model_config=model_config,
+        eagle3_model=getattr(ns, "eagle_model", None),
+        eagle3_num_speculative_tokens=getattr(
+            ns, "num_speculative_tokens", 4),
+        eagle3_batch_sizes=_parse_positive_int_list(
+            getattr(ns, "batch_sizes", "1,2,4,8,16,32,64,128"),
+            "--batch-sizes",
+        ),
+        eagle3_kv_lengths=_parse_positive_int_list(
+            getattr(
+                ns, "kv_lengths",
+                "16,128,256,512,1024,2048,4096,8192,16384",
+            ),
+            "--kv-lengths",
+        ),
     )
 
 
@@ -359,6 +386,39 @@ def build_parser() -> argparse.ArgumentParser:
              "config file under configs/model/.",
     )
     _add_common_flags(p_profile)
+
+
+    # ---- eagle3 ----
+    p_eagle3 = sub.add_parser(
+        "eagle3",
+        help="Profile native EAGLE3 verification+proposal iterations.",
+    )
+    p_eagle3.add_argument(
+        "model",
+        help="Target HF model id, e.g. meta-llama/Llama-3.1-8B-Instruct.",
+    )
+    p_eagle3.add_argument(
+        "--eagle-model",
+        required=True,
+        help="Target-specific EAGLE3 head on Hugging Face.",
+    )
+    p_eagle3.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=4,
+        help="Fixed EAGLE3 proposal length for this engine run.",
+    )
+    p_eagle3.add_argument(
+        "--batch-sizes",
+        default="1,2,4,8,16,32,64,128",
+        help="Comma-separated request batch sizes.",
+    )
+    p_eagle3.add_argument(
+        "--kv-lengths",
+        default="16,128,256,512,1024,2048,4096,8192,16384",
+        help="Comma-separated uniform KV lengths.",
+    )
+    _add_common_flags(p_eagle3)
 
     # ---- slice ----
     p_slice = sub.add_parser(
@@ -417,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     # 5. Dispatch.
     if ns.cmd == "profile":
         run_full(arch_path, profile_args, ns.out_root)
+    elif ns.cmd == "eagle3":
+        run_eagle3(arch_path, profile_args, ns.out_root)
     elif ns.cmd == "slice":
         run_slice(
             arch_path,

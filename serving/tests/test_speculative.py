@@ -71,6 +71,28 @@ class SpeculativeRoleInferenceTest(unittest.TestCase):
             ['draft', 'target'],
         )
 
+    def test_eagle3_role_is_colocated(self):
+        source = Path('serving/__main__.py').read_text(encoding='utf-8')
+        module = ast.parse(source)
+        function = next(
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == '_resolve_speculative_roles')
+        namespace = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<roles>', 'exec'), namespace)
+        instances = [{'pd_type': None, 'tp_size': 1, 'pp_size': 1}]
+        configs = [{
+            'speculative_decoding': True,
+            'speculative_method': 'eagle3',
+            'speculative_draft_model': 'org/eagle3-head',
+            'speculative_role': None,
+            'enable_attn_offloading': False,
+        }]
+
+        namespace['_resolve_speculative_roles'](instances, configs)
+
+        self.assertEqual(configs[0]['speculative_role'], 'eagle3')
+
+
 
 class SpeculativeRouterTest(unittest.TestCase):
     def setUp(self):

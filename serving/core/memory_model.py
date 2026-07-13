@@ -176,7 +176,8 @@ class MemoryModel():
         block_kv_size = 0
         for i in range(batch_len):
             req = batch_req[i]
-            is_spec_verify = getattr(req, "speculative_stage", None) == "verify"
+            is_spec_verify = getattr(req, "speculative_stage", None) in (
+                "verify", "eagle3")
             if req.evict or req.is_prefill() or is_spec_verify:
                 # Prefill, verify, and reloaded decode requests may allocate
                 # newly computed blocks. Existing evicted KV is reloaded

@@ -21,6 +21,8 @@ class Router:
             s for s in schedulers if s.speculative_decoding and s.speculative_role == 'draft']
         self.speculative_target_schedulers = [
             s for s in schedulers if s.speculative_decoding and s.speculative_role == 'target']
+        self.eagle3_schedulers = [
+            s for s in schedulers if s.speculative_decoding and s.speculative_role == 'eagle3']
         self.decode_instances = len(self.decode_schedulers)
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
@@ -141,6 +143,28 @@ class Router:
 
     def _select_scheduler_for_request(self, req_data):
         route_to = self._normalize_route_to(req_data.get('route_to'))
+        if self.eagle3_schedulers:
+            candidates = self.eagle3_schedulers
+            instance_id = req_data.get('instance_id')
+            model_name = req_data.get('model_name')
+            if instance_id is not None:
+                idx = int(instance_id)
+                if idx < 0 or idx >= len(self.schedulers):
+                    raise IndexError(
+                        f"Requested instance_id {idx} for request "
+                        f"{req_data.get('index')} is out of range"
+                    )
+                scheduler = self.schedulers[idx]
+                if scheduler not in candidates:
+                    raise ValueError(
+                        f"Requested instance_id {idx} is not an EAGLE3 instance"
+                    )
+                candidates = [scheduler]
+            if model_name is not None:
+                candidates = [s for s in candidates if s.model == model_name]
+            if not candidates:
+                raise LookupError(f"No EAGLE3 scheduler matches model {model_name!r}")
+            return candidates[self._select_instance(candidates, 'prefill')]
         if self.speculative_draft_schedulers and self.speculative_target_schedulers:
             # The workload's model_name describes the served target model;
             # speculative admission always begins on a draft-role instance.

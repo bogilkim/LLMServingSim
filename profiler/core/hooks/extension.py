@@ -26,7 +26,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from profiler.core.hooks.batch import Shot, assemble_scheduler_output
+from profiler.core.hooks.batch import (
+    Shot,
+    assemble_eagle3_seed_output,
+    assemble_eagle3_verify_output,
+    assemble_scheduler_output,
+)
 from profiler.core.hooks.moe_hook import (
     ExpertRoute,
     force_moe_routing,
@@ -125,3 +130,88 @@ class Extension:
 
         samples = extract_samples(summary, slice_)
         return [s.as_dict() for s in samples]
+
+    def fire_eagle3(
+        self,
+        shot_dict: dict[str, Any],
+        iterations: int = 3,
+    ) -> dict[str, float]:
+        """Measure one native verify+sample+next-proposal EAGLE3 iteration."""
+        import torch
+
+        spec_config = getattr(self.model_runner, "speculative_config", None)
+        if spec_config is None or spec_config.method != "eagle3":
+            raise RuntimeError("fire_eagle3 requires a native vLLM EAGLE3 engine")
+        if not hasattr(self.model_runner, "drafter"):
+            raise RuntimeError("vLLM model runner did not initialize an EAGLE3 drafter")
+
+        batch_size = int(shot_dict["batch_size"])
+        kv_len = int(shot_dict["kv_len"])
+        num_speculative_tokens = int(shot_dict["num_speculative_tokens"])
+        if num_speculative_tokens != int(spec_config.num_speculative_tokens):
+            raise ValueError(
+                "shot num_speculative_tokens must match the engine configuration"
+            )
+        iterations = max(1, int(iterations))
+
+        sequence = int(getattr(self, "_eagle3_profile_sequence", 0))
+        live_req_ids = list(getattr(self, "_eagle3_profile_live_req_ids", []))
+        elapsed_ms = []
+
+        def _execute(scheduler_output):
+            output = self.model_runner.execute_model(scheduler_output)
+            if output is None:
+                output = self.model_runner.sample_tokens(None)
+            return output
+
+        # One extra iteration warms the verification query shape. Every
+        # iteration gets a fresh synthetic request set so random acceptance
+        # from dummy weights cannot alter the next measurement's KV length.
+        for measurement_idx in range(iterations + 1):
+            request_prefix = f"eagle3_profile_{sequence}"
+            sequence += 1
+            seed, req_ids = assemble_eagle3_seed_output(
+                batch_size=batch_size,
+                kv_len=kv_len,
+                num_speculative_tokens=num_speculative_tokens,
+                model_runner=self.model_runner,
+                request_prefix=request_prefix,
+                finished_req_ids=live_req_ids,
+            )
+            _execute(seed)
+            draft_rows, draft_req_ids = self.model_runner._get_draft_token_ids_cpu()
+            draft_by_req = {
+                req_id: list(tokens[:num_speculative_tokens])
+                for req_id, tokens in zip(draft_req_ids, draft_rows)
+                if req_id in req_ids
+            }
+            if set(draft_by_req) != set(req_ids):
+                raise RuntimeError(
+                    "vLLM did not return one EAGLE3 draft row per synthetic request"
+                )
+
+            verify = assemble_eagle3_verify_output(
+                req_ids=req_ids,
+                kv_len=kv_len,
+                draft_token_ids=draft_by_req,
+                model_runner=self.model_runner,
+            )
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            _execute(verify)
+            end.record()
+            end.synchronize()
+            measured_ms = float(start.elapsed_time(end))
+            # Synchronize vLLM's asynchronous draft-token D2H copy before
+            # the next request set reuses its staging buffer.
+            self.model_runner._get_draft_token_ids_cpu()
+            if measurement_idx > 0:
+                elapsed_ms.append(measured_ms)
+            live_req_ids = req_ids
+
+        self._eagle3_profile_sequence = sequence
+        self._eagle3_profile_live_req_ids = live_req_ids
+        return {
+            "microseconds": sum(elapsed_ms) * 1000.0 / len(elapsed_ms),
+        }

@@ -547,9 +547,38 @@ def persist_meta(
         "measurement_iterations": args.measurement_iterations,
         "skew_profile": _skew_meta_block(args),
         "skew_fit": _skew_fit_block(variant_root, args.tp_degrees),
+        "eagle3_profile": (
+            {
+                "enabled": True,
+                "profiled_at": _utcnow_iso(),
+                "draft_model": args.eagle3_model,
+                "num_speculative_tokens": args.eagle3_num_speculative_tokens,
+                "batch_sizes": args.eagle3_batch_sizes,
+                "kv_lengths": args.eagle3_kv_lengths,
+                "iteration_table": "tp1/eagle3.csv",
+                "timing_scope": "target_verify+sample+next_eagle_proposal",
+            }
+            if args.eagle3_model else {"enabled": False}
+        ),
     }
     variant_root.mkdir(parents=True, exist_ok=True)
     out = variant_root / "meta.yaml"
+    existing = {}
+    if out.is_file():
+        with out.open("r", encoding="utf-8") as f:
+            existing = yaml.safe_load(f) or {}
+
+    if args.eagle3_model and existing:
+        # The EAGLE3 command supplements an existing layerwise profile.
+        # Preserve its TP, attention, and skew metadata verbatim.
+        existing["eagle3_profile"] = meta["eagle3_profile"]
+        meta = existing
+    elif not args.eagle3_model:
+        # A later layerwise refresh must not discard a measured EAGLE3 table.
+        existing_eagle3 = existing.get("eagle3_profile")
+        if existing_eagle3 and existing_eagle3.get("enabled"):
+            meta["eagle3_profile"] = existing_eagle3
+
     with out.open("w", encoding="utf-8") as f:
         yaml.dump(meta, f, Dumper=_CompactDumper, sort_keys=False)
     log.debug("wrote meta.yaml → %s", out)

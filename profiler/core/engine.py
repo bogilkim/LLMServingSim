@@ -243,6 +243,46 @@ def spin_up(
     return llm, kwargs, tmpdir
 
 
+def spin_up_eagle3(
+    args: ProfileArgs,
+) -> tuple[LLM, dict[str, Any], Path]:
+    """Construct a full target model with a native vLLM EAGLE3 proposer.
+
+    Unlike the regular layerwise profiler, this path must not collapse the
+    target to one decoder layer: EAGLE3 consumes auxiliary hidden states from
+    target-specific layers. We still use dummy weights, so kernel shapes and
+    execution paths are real without downloading the target checkpoint.
+    """
+    if not args.eagle3_model:
+        raise ValueError("spin_up_eagle3 requires args.eagle3_model")
+    if args.model_config is None:
+        raise ValueError("spin_up_eagle3 requires args.model_config")
+
+    kwargs = fuse_engine_kwargs(args, 1)
+    # Remove the regular profiler's num_hidden_layers=1 override. Explicit
+    # caller overrides remain useful for controlled experiments, but the
+    # default EAGLE3 run always preserves the target's full layer topology.
+    kwargs["hf_overrides"] = copy.deepcopy(args.hf_overrides or {})
+    kwargs["speculative_config"] = {
+        "method": "eagle3",
+        "model": args.eagle3_model,
+        "num_speculative_tokens": int(args.eagle3_num_speculative_tokens),
+        "draft_tensor_parallel_size": 1,
+        "enforce_eager": True,
+    }
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="profiler_eagle3_target_"))
+    (tmpdir / "config.json").write_text(
+        json.dumps(args.model_config, indent=2),
+        encoding="utf-8",
+    )
+    kwargs["model"] = str(tmpdir)
+
+    with log.capture_stdio():
+        llm = LLM(**kwargs)
+    return llm, kwargs, tmpdir
+
+
 def probe_limits(llm: LLM) -> RuntimeLimits:
     """Read back the runtime shapes the engine accepted.
 

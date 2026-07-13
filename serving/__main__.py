@@ -188,6 +188,10 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
             "speculative_decoding": instance.get(
                 "speculative_decoding", args.speculative_decoding),
+            "speculative_method": instance.get(
+                "speculative_method", args.speculative_method),
+            "speculative_draft_model": instance.get(
+                "speculative_draft_model", args.speculative_draft_model),
             "speculative_role": instance.get("speculative_role"),
             "speculative_draft_length": instance.get(
                 "speculative_draft_length", args.speculative_draft_length),
@@ -202,7 +206,32 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
 
 def _resolve_speculative_roles(instances, runtime_configs):
     enabled = [i for i, cfg in enumerate(runtime_configs) if cfg["speculative_decoding"]]
-    for i in enabled:
+    eagle3 = [
+        i for i in enabled
+        if runtime_configs[i].get("speculative_method") == "eagle3"
+    ]
+    for i in eagle3:
+        role = runtime_configs[i].get("speculative_role")
+        if role not in (None, "eagle3"):
+            raise ValueError("EAGLE3 instances use speculative_role='eagle3'.")
+        if not runtime_configs[i].get("speculative_draft_model"):
+            raise ValueError("EAGLE3 requires speculative_draft_model.")
+        if instances[i].get("tp_size", 1) != 1 or instances[i].get("pp_size", 1) != 1:
+            raise ValueError(
+                "EAGLE3 aggregate profiles currently require tp_size=1 and pp_size=1.")
+        if instances[i].get("dp_group") is not None:
+            raise ValueError(
+                "EAGLE3 aggregate profiles do not support DP groups.")
+        if runtime_configs[i].get("enable_attn_offloading"):
+            raise ValueError(
+                "EAGLE3 aggregate profiles do not support attention offloading.")
+        runtime_configs[i]["speculative_role"] = "eagle3"
+
+    classic = [i for i in enabled if i not in eagle3]
+    if eagle3 and classic:
+        raise ValueError(
+            "Do not mix EAGLE3 and draft-model speculative instances in one run.")
+    for i in classic:
         role = runtime_configs[i].get("speculative_role")
         if role is None:
             pd_type = instances[i].get("pd_type")
@@ -212,8 +241,8 @@ def _resolve_speculative_roles(instances, runtime_configs):
                 role = "target"
         runtime_configs[i]["speculative_role"] = role
 
-    missing = [i for i in enabled if runtime_configs[i]["speculative_role"] is None]
-    assigned = {runtime_configs[i]["speculative_role"] for i in enabled} - {None}
+    missing = [i for i in classic if runtime_configs[i]["speculative_role"] is None]
+    assigned = {runtime_configs[i]["speculative_role"] for i in classic} - {None}
     if len(missing) == 2 and not assigned:
         runtime_configs[missing[0]]["speculative_role"] = "draft"
         runtime_configs[missing[1]]["speculative_role"] = "target"
@@ -221,11 +250,12 @@ def _resolve_speculative_roles(instances, runtime_configs):
         runtime_configs[missing[0]]["speculative_role"] = (
             "target" if "draft" in assigned else "draft")
     elif missing:
-        raise ValueError("Set speculative_role to draft or target on each speculative instance.")
+        raise ValueError("Set speculative_role to draft or target on each draft-model instance.")
 
-    roles = {runtime_configs[i]["speculative_role"] for i in enabled}
-    if enabled and roles != {"draft", "target"}:
-        raise ValueError("Speculative decoding requires at least one draft and one target instance.")
+    roles = {runtime_configs[i]["speculative_role"] for i in classic}
+    if classic and roles != {"draft", "target"}:
+        raise ValueError(
+            "Draft-model speculative decoding requires at least one draft and one target instance.")
 
 
 def _resolve_trace_paths(runtime_configs, launch_cwd):
@@ -338,6 +368,11 @@ def main():
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
     parser.add_argument('--speculative-decoding', action=argparse.BooleanOptionalAction, default=False,
                         help='enable speculative decoding with separate draft and target scheduler roles')
+    parser.add_argument('--speculative-method', type=str, choices=['draft_model', 'eagle3'],
+                        default='draft_model',
+                        help='speculative method: independent draft_model or colocated native eagle3')
+    parser.add_argument('--speculative-draft-model', type=str, default=None,
+                        help='target-specific EAGLE3 draft head identifier recorded in profile metadata')
     parser.add_argument('--speculative-draft-length', type=int, default=4,
                         help='number of draft tokens to generate before verification')
     parser.add_argument('--speculative-acceptance-model', type=str, choices=['constant', 'random', 'trace'],
@@ -527,6 +562,8 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             speculative_decoding=inst_cfg["speculative_decoding"],
             speculative_role=speculative_role,
+            speculative_method=inst_cfg["speculative_method"],
+            speculative_draft_model=inst_cfg["speculative_draft_model"],
             speculative_draft_length=inst_cfg["speculative_draft_length"],
             speculative_acceptance_model=inst_cfg["speculative_acceptance_model"],
             speculative_acceptance_rate=inst_cfg["speculative_acceptance_rate"],

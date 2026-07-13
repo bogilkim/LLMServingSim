@@ -424,10 +424,18 @@ class ProfileArgs:
     whose keys are already measured, so a re-run after a feasibility
     change adds only the newly-eligible cases. Applies to both the
     main loop categories (dense/per_sequence/attention/moe) and skew."""
-    """Number of timed forward passes per shot, averaged by vLLM's
-    layerwise_profile via its ``invocations`` count. A single sample
-    can swing 15-25% on large GEMMs due to DVFS / clock-state jitter;
-    N=3 cuts that jitter to ~5% at ~3x profile time."""
+    # Native EAGLE3 profiling. These fields are ignored by the regular
+    # layerwise profile command and populated by ``python -m profiler
+    # eagle3``. EAGLE heads are target-model specific, so the table is
+    # stored alongside the target model's normal profile bundle.
+    eagle3_model: str | None = None
+    eagle3_num_speculative_tokens: int = 4
+    eagle3_batch_sizes: list[int] = field(
+        default_factory=lambda: [1, 2, 4, 8, 16, 32, 64, 128]
+    )
+    eagle3_kv_lengths: list[int] = field(
+        default_factory=lambda: [16, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    )
 
     # ------------------------------------------------------------------
     # Derived properties

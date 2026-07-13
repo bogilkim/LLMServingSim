@@ -22,7 +22,8 @@ class Scheduler:
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
-                 speculative_decoding=False, speculative_role=None,
+                 speculative_decoding=False, speculative_role=None, speculative_method='draft_model',
+                 speculative_draft_model=None,
                  speculative_draft_length=4, speculative_acceptance_model='constant',
                  speculative_acceptance_rate=0.8, speculative_acceptance_trace=None):
         self.model = model
@@ -47,19 +48,35 @@ class Scheduler:
         self.prioritize_prefill = prioritize_prefill
 
         self.speculative_decoding = bool(speculative_decoding)
+        self.speculative_method = str(speculative_method or 'draft_model').lower()
+        self.speculative_draft_model = speculative_draft_model
+        if self.speculative_method not in ('draft_model', 'eagle3'):
+            raise ValueError(f"Unsupported speculative_method {speculative_method!r}.")
         self.speculative_role = speculative_role.lower() if isinstance(speculative_role, str) else speculative_role
         if self.speculative_decoding and self.speculative_role is None:
-            raise ValueError("speculative decoding requires each instance to have a draft or target role")
-        if self.speculative_role not in (None, 'draft', 'target'):
-            raise ValueError(f"Unsupported speculative_role {speculative_role!r}. Expected draft, target, or None.")
+            raise ValueError("speculative decoding requires a scheduler role")
+        if self.speculative_role not in (None, 'draft', 'target', 'eagle3'):
+            raise ValueError(
+                f"Unsupported speculative_role {speculative_role!r}. "
+                "Expected draft, target, eagle3, or None.")
+        if (self.speculative_decoding and self.speculative_method == 'eagle3'
+                and self.speculative_role != 'eagle3'):
+            raise ValueError("EAGLE3 requires speculative_role='eagle3'.")
+        if (self.speculative_decoding and self.speculative_method == 'eagle3'
+                and not self.speculative_draft_model):
+            raise ValueError("EAGLE3 requires speculative_draft_model.")
         self.speculative_draft_length = max(1, int(speculative_draft_length)) if self.speculative_decoding else 0
+        if (self.speculative_decoding and self.speculative_method == 'eagle3'
+                and self.max_num_batched_tokens < self.speculative_draft_length + 1):
+            raise ValueError(
+                "EAGLE3 max_num_batched_tokens must fit draft_length + 1.")
         self.speculative_acceptance_model = (
             SpeculativeAcceptanceModel(
                 mode=speculative_acceptance_model,
                 acceptance_rate=speculative_acceptance_rate,
                 trace_path=speculative_acceptance_trace,
                 seed=42,
-            ) if self.speculative_decoding and self.speculative_role == 'target' else None
+            ) if self.speculative_decoding and self.speculative_role in ('target', 'eagle3') else None
         )
 
         # lists are sorted in arrival time manner
@@ -82,10 +99,97 @@ class Scheduler:
                 return batch
             if any(req.arrival <= current and req.speculative_stage == 'verify' for req in self.request):
                 return None
+        if self.speculative_decoding and self.speculative_role == 'eagle3':
+            batch = self.schedule_eagle3(current, sys, batch_id)
+            if batch is not None:
+                return batch
+            if any(req.arrival <= current and req.speculative_stage == 'eagle3'
+                   for req in self.request):
+                return None
         if self.enable_prefix_caching:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
             return self.schedule_base(current, sys, batch_id)
+
+    def schedule_eagle3(self, current, sys, batch_id=-1):
+        """Schedule one colocated native EAGLE3 iteration.
+
+        The profiler measures target verification, rejection sampling, and
+        next proposal as one atomic GPU stage, so the simulator batches only
+        requests with the same proposal length.
+        """
+        if self.speculative_role != 'eagle3':
+            return None
+        if sys != self.start_npu:
+            if not self.inflight:
+                return None
+            batch = next(
+                (b for b in self.inflight if b.batch_id == batch_id),
+                None,
+            )
+            if batch is None or sys in batch.fired:
+                return None
+            batch.fired.append(sys)
+            return batch
+
+        if self.request and self.request[0].arrival > current:
+            return None
+        if len(self.inflight) >= self.pp_size:
+            return None
+
+        candidates = [
+            req for req in self.request
+            if req.arrival <= current and req.speculative_stage == 'eagle3'
+        ]
+        running_reqs = sum(len(batch.requests) for batch in self.inflight)
+        available_slots = max(0, int(self.max_num_seqs) - running_reqs)
+        if not candidates or available_slots == 0:
+            return None
+
+        proposal_len = max(1, int(candidates[0].speculative_draft_tokens))
+        candidates = [
+            req for req in candidates
+            if int(req.speculative_draft_tokens) == proposal_len
+        ][:available_slots]
+        verify_tokens = proposal_len + 1
+        max_batch = max(1, int(self.max_num_batched_tokens) // verify_tokens)
+        batch_req = candidates[:max_batch]
+        scheduled_tokens = {req.id: verify_tokens for req in batch_req}
+
+        kv_size = self.memory.get_block_kv(
+            batch_req, len(batch_req), scheduled_tokens)
+        while batch_req and not self.memory.is_avail(kv_size, Device.NPU):
+            dropped = batch_req.pop()
+            scheduled_tokens.pop(dropped.id, None)
+            kv_size = self.memory.get_block_kv(
+                batch_req, len(batch_req), scheduled_tokens)
+        if not batch_req:
+            raise RuntimeError(
+                "EAGLE3 cannot make progress because target KV memory is exhausted.")
+
+        for req in batch_req:
+            self.request.remove(req)
+        if kv_size > 0:
+            self.memory.allocate(kv_size, Device.NPU)
+
+        total_len = len(batch_req) * verify_tokens
+        kv_lens = [int(req.speculative_target_tokens) for req in batch_req]
+        batch = Batch(
+            self.get_batch_id(), self.model, total_len, sum(kv_lens),
+            [verify_tokens] * len(batch_req), [], len(batch_req), 0,
+            [verify_tokens] * len(batch_req), kv_lens, [], current,
+            kv_size, 0, 0,
+        )
+        batch.speculative_stage = 'eagle3'
+        batch.eagle3_batch_size = len(batch_req)
+        batch.eagle3_kv_len = sum(kv_lens) // len(kv_lens)
+        batch.eagle3_num_speculative_tokens = proposal_len
+        batch.eagle3_draft_model = self.speculative_draft_model
+        batch.scheduled_tokens = scheduled_tokens
+        batch.fired.append(sys)
+        batch.requests.extend(batch_req)
+        self.inflight.append(batch)
+        return batch
 
     def schedule_speculative_verify(self, current, sys, batch_id=-1):
         if self.speculative_role != 'target':
@@ -831,6 +935,63 @@ class Scheduler:
         batch_stage = getattr(batch, 'speculative_stage', None)
 
         for req in batch.requests:
+            # Native EAGLE3 is profiled as one colocated verification,
+            # rejection-sampling, and next-proposal stage.
+            if (self.speculative_decoding and self.speculative_role == 'eagle3'
+                    and batch_stage == 'eagle3'
+                    and req.speculative_stage == 'eagle3'):
+                base_tokens = int(req.speculative_target_tokens)
+                verify_tokens = int(batch.scheduled_tokens[req.id])
+                accepted = self.speculative_acceptance_model.sample(
+                    request=req,
+                    iteration=req.speculative_iteration,
+                    draft_tokens=req.speculative_draft_tokens,
+                )
+                accepted = min(
+                    max(0, accepted),
+                    max(0, req.output - base_tokens - 1),
+                )
+                committed = base_tokens + accepted + 1
+                req.speculative_accept_tokens = accepted
+                gen_t += accepted + 1
+
+                self.memory.adjust_tokens(
+                    base_tokens + verify_tokens, committed, Device.NPU)
+                req.num_computed_tokens = committed
+                req.speculative_target_tokens = committed
+                req.speculative_target_kv_tokens = committed
+
+                if req.speculative_first_commit_pending:
+                    req.set_ttft(finish)
+                    req.speculative_first_commit_pending = False
+                    req.is_init = False
+                    if accepted:
+                        req.itl.extend([0] * accepted)
+                else:
+                    req.add_itl(finish)
+                    if accepted:
+                        req.itl.extend([0] * accepted)
+
+                req.speculative_iteration += 1
+                if committed >= req.output:
+                    kv_size = self.memory.get_evict_kv(req)
+                    self.memory.free(kv_size, Device.NPU)
+                    req.add_latency(finish)
+                    req.speculative_stage = None
+                    req.speculative_target_kv_tokens = 0
+                    self.done.append(req)
+                    final_reqs.append(req)
+                else:
+                    req.speculative_draft_tokens = min(
+                        self.speculative_draft_length,
+                        max(0, int(self.max_num_batched_tokens) - 1),
+                    )
+                    req.speculative_verify_tokens = (
+                        req.speculative_draft_tokens + 1)
+                    req.speculative_stage = 'eagle3'
+                    pool.append(req)
+                continue
+
             # Ingest the target-produced token before drafting again.
             if self.speculative_decoding and req.speculative_stage == 'draft_sync':
                 req.num_computed_tokens += 1
@@ -920,6 +1081,26 @@ class Scheduler:
                 # Update num_computed_tokens
                 req.num_computed_tokens += chunk_len
                 req.chunk_len = 0  # Reset for next step
+                if (self.speculative_decoding and self.speculative_role == 'eagle3'
+                        and req.speculative_stage == 'eagle3_prefill'):
+                    prompt_t += chunk_len
+                    if req.num_computed_tokens < req.original_input:
+                        pool.append(req)
+                        continue
+                    req.speculative_target_tokens = req.num_computed_tokens
+                    req.speculative_target_kv_tokens = req.num_computed_tokens
+                    req.speculative_first_commit_pending = True
+                    req.speculative_iteration = 0
+                    req.speculative_draft_tokens = min(
+                        self.speculative_draft_length,
+                        max(0, int(self.max_num_batched_tokens) - 1),
+                    )
+                    req.speculative_verify_tokens = (
+                        req.speculative_draft_tokens + 1)
+                    req.speculative_stage = 'eagle3'
+                    pool.append(req)
+                    continue
+
 
                 if (self.speculative_decoding and self.speculative_role == 'target'
                         and req.speculative_stage == 'target_prefill'):
@@ -1078,6 +1259,12 @@ class Scheduler:
             new_req.speculative_active = True
             new_req.speculative_stage = 'draft_prefill'
             new_req.speculative_draft_instance_id = self.instance_id
+            new_req.is_init = True
+        elif (self.speculative_decoding and self.speculative_role == 'eagle3'
+              and new_req.speculative_stage is None):
+            new_req.speculative_active = True
+            new_req.speculative_stage = 'eagle3_prefill'
+            new_req.speculative_target_instance_id = self.instance_id
             new_req.is_init = True
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
         return
