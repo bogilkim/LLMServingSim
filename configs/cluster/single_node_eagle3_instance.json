@@ -1,0 +1,29 @@
+{
+  "num_nodes": 1,
+  "link_bw": 16,
+  "link_latency": 0,
+  "nodes": [
+    {
+      "num_instances": 1,
+      "cpu_mem": {"mem_size": 512, "mem_bw": 256, "mem_latency": 0},
+      "instances": [
+        {
+          "model_name": "meta-llama/Llama-3.1-8B",
+          "hardware": "RTXPRO6000",
+          "npu_mem": {"mem_size": 96, "mem_bw": 1597, "mem_latency": 0},
+          "pd_type": null,
+          "tp_size": 1,
+          "pp_size": 1,
+          "speculative_decoding": true,
+          "speculative_method": "eagle3",
+          "speculative_draft_model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+          "speculative_draft_length": 4,
+          "speculative_acceptance_model": "constant",
+          "speculative_acceptance_rate": 0.8,
+          "enable_prefix_caching": false,
+          "enable_attn_offloading": false
+        }
+      ]
+    }
+  ]
+}
