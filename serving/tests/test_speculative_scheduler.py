@@ -51,6 +51,12 @@ def _scheduler(role):
         'constant', acceptance_rate=0.5)
     scheduler.max_num_batched_tokens = 16
     scheduler.start_npu = 0
+    scheduler.max_num_seqs = 8
+    scheduler.pp_size = 1
+    scheduler.model = 'target'
+    scheduler.speculative_draft_model = 'org/eagle3-head'
+    scheduler.inflight = []
+    scheduler.batch_ids = -1
     scheduler.num_npus = 1
     scheduler.pd_type = None
     scheduler.enable_prefix_caching = False
@@ -126,16 +132,82 @@ class SpeculativeSchedulerTest(unittest.TestCase):
         self.assertEqual(request.speculative_stage, 'draft')
         self.assertEqual(request.speculative_draft_kv_tokens, 13)
 
+    def test_eagle3_prefill_transitions_to_seed(self):
+        scheduler = _scheduler('eagle3')
+        request = Request(0, 'target', 10, 30, 0, 0)
+        request.speculative_active = True
+        request.speculative_stage = 'eagle3_prefill'
+        request.chunk_len = 10
+        scheduler.inflight = [_batch(request)]
+
+        prompt, generated, final, transfer = scheduler.add_done(1, 0, 100)
+
+        self.assertEqual((prompt, generated), (10, 0))
+        self.assertEqual(final, [])
+        self.assertEqual(transfer, [])
+        self.assertEqual(request.speculative_target_tokens, 10)
+        self.assertEqual(request.speculative_target_kv_tokens, 10)
+        self.assertEqual(request.speculative_stage, 'eagle3_seed')
+        self.assertIn(request, scheduler.request)
+
+    def test_eagle3_seed_batch_uses_prompt_kv_length(self):
+        scheduler = _scheduler('eagle3')
+        request = Request(0, 'target', 128, 200, 0, 0)
+        request.speculative_active = True
+        request.speculative_stage = 'eagle3_seed'
+        request.speculative_draft_tokens = 4
+        request.num_computed_tokens = 128
+        scheduler.request = [request]
+
+        batch = scheduler.schedule_eagle3_seed(0, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.speculative_stage, 'eagle3_seed')
+        self.assertEqual(batch.eagle3_batch_size, 1)
+        self.assertEqual(batch.eagle3_kv_len, 128)
+        self.assertEqual(batch.eagle3_num_speculative_tokens, 4)
+        self.assertEqual(batch.eagle3_draft_model, 'org/eagle3-head')
+        self.assertEqual(batch.kv_size, 0)
+        self.assertEqual(scheduler.request, [])
+        self.assertIn(batch, scheduler.inflight)
+
+    def test_eagle3_seed_commits_first_token_and_sets_ttft(self):
+        scheduler = _scheduler('eagle3')
+        request = Request(0, 'target', 10, 30, 0, 0)
+        request.speculative_active = True
+        request.speculative_stage = 'eagle3_seed'
+        request.speculative_target_tokens = 10
+        request.speculative_target_kv_tokens = 10
+        request.speculative_draft_tokens = 4
+        request.speculative_verify_tokens = 5
+        request.speculative_first_commit_pending = True
+        request.num_computed_tokens = 10
+        scheduler.inflight = [_batch(request, 'eagle3_seed')]
+
+        _, generated, final, transfer = scheduler.add_done(1, 0, 100)
+
+        self.assertEqual(generated, 1)
+        self.assertEqual(final, [])
+        self.assertEqual(transfer, [])
+        self.assertEqual(scheduler.memory.adjustments, [])
+        self.assertEqual(request.ttft, 100)
+        self.assertEqual(request.speculative_target_tokens, 11)
+        self.assertEqual(request.speculative_target_kv_tokens, 10)
+        self.assertEqual(request.num_computed_tokens, 10)
+        self.assertFalse(request.is_init)
+        self.assertEqual(request.speculative_stage, 'eagle3')
+        self.assertIn(request, scheduler.request)
+
     def test_eagle3_iteration_commits_and_requeues(self):
         scheduler = _scheduler('eagle3')
         request = Request(0, 'target', 10, 30, 0, 0)
         request.speculative_active = True
         request.speculative_stage = 'eagle3'
-        request.speculative_target_tokens = 10
-        request.speculative_target_kv_tokens = 15
+        request.speculative_target_tokens = 11
+        request.speculative_target_kv_tokens = 10
         request.speculative_draft_tokens = 4
         request.speculative_verify_tokens = 5
-        request.speculative_first_commit_pending = True
+        request.speculative_first_commit_pending = False
         request.num_computed_tokens = 10
         scheduler.inflight = [
             _batch(request, 'eagle3', scheduled_tokens={request.id: 5})
@@ -147,7 +219,9 @@ class SpeculativeSchedulerTest(unittest.TestCase):
         self.assertEqual(final, [])
         self.assertEqual(transfer, [])
         self.assertEqual(scheduler.memory.adjustments, [(15, 13)])
-        self.assertEqual(request.speculative_target_tokens, 13)
+        self.assertEqual(request.speculative_target_tokens, 14)
+        self.assertEqual(request.speculative_target_kv_tokens, 13)
+        self.assertEqual(request.num_computed_tokens, 13)
         self.assertEqual(request.speculative_draft_tokens, 4)
         self.assertEqual(request.speculative_stage, 'eagle3')
         self.assertIn(request, scheduler.request)

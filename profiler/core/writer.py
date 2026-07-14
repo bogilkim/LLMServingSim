@@ -555,8 +555,12 @@ def persist_meta(
                 "num_speculative_tokens": args.eagle3_num_speculative_tokens,
                 "batch_sizes": args.eagle3_batch_sizes,
                 "kv_lengths": args.eagle3_kv_lengths,
+                "seed_table": "tp1/eagle3_seed.csv",
                 "iteration_table": "tp1/eagle3.csv",
-                "timing_scope": "target_verify+sample+next_eagle_proposal",
+                "timing_scope": {
+                    "seed": "initial_eagle_proposal_only",
+                    "iteration": "target_verify+sample+next_eagle_proposal",
+                },
             }
             if args.eagle3_model else {"enabled": False}
         ),

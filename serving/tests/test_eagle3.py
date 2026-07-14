@@ -27,34 +27,40 @@ except ImportError:
 from serving.core import trace_generator
 
 
+def _eagle3_table(scale=1.0):
+    return {
+        "k_values": [4],
+        "by_k": {
+            4: {
+                "batch_values": [1, 4],
+                "rows": {
+                    1: {
+                        "keys": [128, 256],
+                        "values": [100 * scale, 200 * scale],
+                    },
+                    4: {
+                        "keys": [128, 256],
+                        "values": [400 * scale, 800 * scale],
+                    },
+                },
+            },
+        },
+    }
+
+
 def _perf_db():
     return {
         "meta": {
             "eagle3_profile": {
                 "enabled": True,
                 "draft_model": "org/eagle3-head",
+                "seed_table": "tp1/eagle3_seed.csv",
             },
         },
         "tables": {
             1: {
-                "eagle3": {
-                    "k_values": [4],
-                    "by_k": {
-                        4: {
-                            "batch_values": [1, 4],
-                            "rows": {
-                                1: {
-                                    "keys": [128, 256],
-                                    "values": [100, 200],
-                                },
-                                4: {
-                                    "keys": [128, 256],
-                                    "values": [400, 800],
-                                },
-                            },
-                        },
-                    },
-                },
+                "eagle3": _eagle3_table(),
+                "eagle3_seed": _eagle3_table(0.5),
             },
         },
     }
@@ -67,6 +73,13 @@ class Eagle3LookupTest(unittest.TestCase):
             num_speculative_tokens=4,
         )
         self.assertEqual(latency, 375)
+
+    def test_looks_up_initial_proposal_table(self):
+        latency = trace_generator._lookup_eagle3(
+            _perf_db(), tp=1, batch_size=2, kv_len=192,
+            num_speculative_tokens=4, table_name="eagle3_seed",
+        )
+        self.assertEqual(latency, 188)
 
     def test_requires_exact_profiled_proposal_length(self):
         with self.assertRaisesRegex(KeyError, "k=3"):

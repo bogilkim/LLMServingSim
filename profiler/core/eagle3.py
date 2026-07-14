@@ -65,15 +65,22 @@ def run_eagle3(arch_path: Path, args: ProfileArgs, out_root: Path) -> None:
 
     variant_root = _variant_root(out_root, args)
     tp_root = variant_root / "tp1"
-    sink = DedupSink(
+    iteration_sink = DedupSink(
         tp_root / "eagle3.csv",
         ["batch_size", "kv_len", "num_speculative_tokens"],
     )
+    seed_sink = DedupSink(
+        tp_root / "eagle3_seed.csv",
+        ["batch_size", "kv_len", "num_speculative_tokens"],
+    )
 
-    prior = set()
+    iteration_prior = set()
+    seed_prior = set()
     if not args.force:
-        sink.preload()
-        prior = sink.prior_shot_keys()
+        iteration_sink.preload()
+        seed_sink.preload()
+        iteration_prior = iteration_sink.prior_shot_keys()
+        seed_prior = seed_sink.prior_shot_keys()
 
     llm = None
     tmpdir = None
@@ -89,7 +96,10 @@ def run_eagle3(arch_path: Path, args: ProfileArgs, out_root: Path) -> None:
             for kv_len in sorted(set(args.eagle3_kv_lengths))
             if _feasible(int(batch_size), int(kv_len), args, limits)
         ]
-        shots = [shot for shot in shots if shot not in prior]
+        shots = [
+            shot for shot in shots
+            if shot not in iteration_prior or shot not in seed_prior
+        ]
 
         if not shots:
             log.info("eagle3: nothing to do (all feasible shots already measured)")
@@ -108,17 +118,33 @@ def run_eagle3(arch_path: Path, args: ProfileArgs, out_root: Path) -> None:
                         ),
                     )
                     result = raw[0]
-                    sink.coalesce(
-                        Eagle3Point(
-                            batch_size=batch_size,
-                            kv_len=kv_len,
-                            num_speculative_tokens=num_speculative_tokens,
-                            microseconds=float(result["microseconds"]),
+                    if (
+                        batch_size, kv_len, num_speculative_tokens
+                    ) not in iteration_prior:
+                        iteration_sink.coalesce(
+                            Eagle3Point(
+                                batch_size=batch_size,
+                                kv_len=kv_len,
+                                num_speculative_tokens=num_speculative_tokens,
+                                microseconds=float(result["microseconds"]),
+                            )
                         )
-                    )
+                    if (
+                        batch_size, kv_len, num_speculative_tokens
+                    ) not in seed_prior:
+                        seed_sink.coalesce(
+                            Eagle3Point(
+                                batch_size=batch_size,
+                                kv_len=kv_len,
+                                num_speculative_tokens=num_speculative_tokens,
+                                microseconds=float(result["seed_microseconds"]),
+                            )
+                        )
                     bar.advance(1)
-        sink.flush()
-        log.success("eagle3 → %s", sink.path)
+        iteration_sink.flush()
+        seed_sink.flush()
+        log.success("eagle3 iteration → %s", iteration_sink.path)
+        log.success("eagle3 initial proposal → %s", seed_sink.path)
     finally:
         if llm is not None and tmpdir is not None:
             spin_down(llm, tmpdir)

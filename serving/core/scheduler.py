@@ -100,6 +100,12 @@ class Scheduler:
             if any(req.arrival <= current and req.speculative_stage == 'verify' for req in self.request):
                 return None
         if self.speculative_decoding and self.speculative_role == 'eagle3':
+            batch = self.schedule_eagle3_seed(current, sys, batch_id)
+            if batch is not None:
+                return batch
+            if any(req.arrival <= current and req.speculative_stage == 'eagle3_seed'
+                   for req in self.request):
+                return None
             batch = self.schedule_eagle3(current, sys, batch_id)
             if batch is not None:
                 return batch
@@ -110,6 +116,65 @@ class Scheduler:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
             return self.schedule_base(current, sys, batch_id)
+
+    def schedule_eagle3_seed(self, current, sys, batch_id=-1):
+        """Schedule the initial native EAGLE3 proposal after target prefill."""
+        if self.speculative_role != 'eagle3':
+            return None
+        if sys != self.start_npu:
+            if not self.inflight:
+                return None
+            batch = next(
+                (b for b in self.inflight if b.batch_id == batch_id),
+                None,
+            )
+            if batch is None or sys in batch.fired:
+                return None
+            batch.fired.append(sys)
+            return batch
+
+        if self.request and self.request[0].arrival > current:
+            return None
+        if len(self.inflight) >= self.pp_size:
+            return None
+
+        candidates = [
+            req for req in self.request
+            if req.arrival <= current
+            and req.speculative_stage == 'eagle3_seed'
+        ]
+        running_reqs = sum(len(batch.requests) for batch in self.inflight)
+        available_slots = max(0, int(self.max_num_seqs) - running_reqs)
+        if not candidates or available_slots == 0:
+            return None
+
+        proposal_len = max(1, int(candidates[0].speculative_draft_tokens))
+        candidates = [
+            req for req in candidates
+            if int(req.speculative_draft_tokens) == proposal_len
+        ][:available_slots]
+        max_batch = max(
+            1, int(self.max_num_batched_tokens) // (proposal_len + 1))
+        batch_req = candidates[:max_batch]
+
+        for req in batch_req:
+            self.request.remove(req)
+
+        kv_lens = [int(req.num_computed_tokens) for req in batch_req]
+        batch = Batch(
+            self.get_batch_id(), self.model, 0, sum(kv_lens),
+            [], [], 0, 0, [], [], [], current, 0, 0, 0,
+        )
+        batch.speculative_stage = 'eagle3_seed'
+        batch.eagle3_batch_size = len(batch_req)
+        batch.eagle3_kv_len = sum(kv_lens) // len(kv_lens)
+        batch.eagle3_num_speculative_tokens = proposal_len
+        batch.eagle3_draft_model = self.speculative_draft_model
+        batch.scheduled_tokens = {req.id: 0 for req in batch_req}
+        batch.fired.append(sys)
+        batch.requests.extend(batch_req)
+        self.inflight.append(batch)
+        return batch
 
     def schedule_eagle3(self, current, sys, batch_id=-1):
         """Schedule one colocated native EAGLE3 iteration.
@@ -173,7 +238,7 @@ class Scheduler:
             self.memory.allocate(kv_size, Device.NPU)
 
         total_len = len(batch_req) * verify_tokens
-        kv_lens = [int(req.speculative_target_tokens) for req in batch_req]
+        kv_lens = [int(req.num_computed_tokens) for req in batch_req]
         batch = Batch(
             self.get_batch_id(), self.model, total_len, sum(kv_lens),
             [verify_tokens] * len(batch_req), [], len(batch_req), 0,
@@ -935,12 +1000,42 @@ class Scheduler:
         batch_stage = getattr(batch, 'speculative_stage', None)
 
         for req in batch.requests:
+            # Target prefill has sampled the first output token. Native
+            # EAGLE3 then drafts the initial proposal before that token is
+            # returned to the caller.
+            if (self.speculative_decoding and self.speculative_role == 'eagle3'
+                    and batch_stage == 'eagle3_seed'
+                    and req.speculative_stage == 'eagle3_seed'):
+                committed = min(req.output, req.num_computed_tokens + 1)
+                req.speculative_target_tokens = committed
+                req.speculative_target_kv_tokens = req.num_computed_tokens
+                req.speculative_first_commit_pending = False
+                req.is_init = False
+                gen_t += committed - req.num_computed_tokens
+                req.set_ttft(finish)
+
+                if committed >= req.output:
+                    kv_size = self.memory.get_evict_kv(req)
+                    self.memory.free(kv_size, Device.NPU)
+                    req.add_latency(finish)
+                    req.speculative_stage = None
+                    req.speculative_target_kv_tokens = 0
+                    self.done.append(req)
+                    final_reqs.append(req)
+                else:
+                    req.speculative_stage = 'eagle3'
+                    pool.append(req)
+                continue
+
             # Native EAGLE3 is profiled as one colocated verification,
-            # rejection-sampling, and next-proposal stage.
+            # rejection-sampling, and next-proposal stage. The last sampled
+            # target token is committed output but does not enter KV until the
+            # next iteration, so retained target KV is committed - 1.
             if (self.speculative_decoding and self.speculative_role == 'eagle3'
                     and batch_stage == 'eagle3'
                     and req.speculative_stage == 'eagle3'):
-                base_tokens = int(req.speculative_target_tokens)
+                base_committed = int(req.speculative_target_tokens)
+                computed_before = int(req.num_computed_tokens)
                 verify_tokens = int(batch.scheduled_tokens[req.id])
                 accepted = self.speculative_acceptance_model.sample(
                     request=req,
@@ -949,28 +1044,24 @@ class Scheduler:
                 )
                 accepted = min(
                     max(0, accepted),
-                    max(0, req.output - base_tokens - 1),
+                    max(0, req.output - base_committed - 1),
                 )
-                committed = base_tokens + accepted + 1
+                committed = base_committed + accepted + 1
+                retained_kv_tokens = committed - 1
                 req.speculative_accept_tokens = accepted
                 gen_t += accepted + 1
 
                 self.memory.adjust_tokens(
-                    base_tokens + verify_tokens, committed, Device.NPU)
-                req.num_computed_tokens = committed
+                    computed_before + verify_tokens,
+                    retained_kv_tokens,
+                    Device.NPU,
+                )
+                req.num_computed_tokens = retained_kv_tokens
                 req.speculative_target_tokens = committed
-                req.speculative_target_kv_tokens = committed
-
-                if req.speculative_first_commit_pending:
-                    req.set_ttft(finish)
-                    req.speculative_first_commit_pending = False
-                    req.is_init = False
-                    if accepted:
-                        req.itl.extend([0] * accepted)
-                else:
-                    req.add_itl(finish)
-                    if accepted:
-                        req.itl.extend([0] * accepted)
+                req.speculative_target_kv_tokens = retained_kv_tokens
+                req.add_itl(finish)
+                if accepted:
+                    req.itl.extend([0] * accepted)
 
                 req.speculative_iteration += 1
                 if committed >= req.output:
@@ -1097,7 +1188,7 @@ class Scheduler:
                     )
                     req.speculative_verify_tokens = (
                         req.speculative_draft_tokens + 1)
-                    req.speculative_stage = 'eagle3'
+                    req.speculative_stage = 'eagle3_seed'
                     pool.append(req)
                     continue
 

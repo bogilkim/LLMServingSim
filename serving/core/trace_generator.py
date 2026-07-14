@@ -400,6 +400,11 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         if eagle3_df is not None:
             tables["eagle3"] = _build_eagle3_table(eagle3_df)
 
+
+        eagle3_seed_df = _read_category_csv(
+            os.path.join(tp_dir, "eagle3_seed.csv"), None)
+        if eagle3_seed_df is not None:
+            tables["eagle3_seed"] = _build_eagle3_table(eagle3_seed_df)
         tables_per_tp[tp] = tables
         available_tps.append(tp)
 
@@ -585,11 +590,15 @@ def _axis_bracket(values, query):
     return lo, hi, t
 
 
-def _lookup_eagle3(perf_db, tp, batch_size, kv_len, num_speculative_tokens):
-    tbl = _tp_tables(perf_db, tp).get("eagle3")
+def _lookup_eagle3(perf_db, tp, batch_size, kv_len,
+                   num_speculative_tokens, table_name="eagle3"):
+    tbl = _tp_tables(perf_db, tp).get(table_name)
     if tbl is None or not tbl["k_values"]:
+        filename = (
+            "eagle3_seed.csv" if table_name == "eagle3_seed"
+            else "eagle3.csv")
         raise KeyError(
-            f"Missing eagle3.csv for tp={tp}. Run python -m profiler eagle3.")
+            f"Missing {filename} for tp={tp}. Run python -m profiler eagle3.")
     requested_k = max(1, int(num_speculative_tokens))
     if requested_k not in tbl["by_k"]:
         raise KeyError(
@@ -1502,7 +1511,7 @@ def _synthesize_eagle3_trace(
         power_model, pim_model, fp, variant, kv_cache_dtype='auto',
         runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
         tp_dim=None, ep_dim=None, dp_sum_total_len=0):
-    """Emit one aggregate native EAGLE3 verification/proposal operation."""
+    """Emit an aggregate native EAGLE3 seed or steady-state operation."""
     ctx = _build_trace_ctx(
         hardware, model, config, tp_size, pp_size, local_ep, ep_total,
         node_id, fp, placement, None, False, power_model, pim_model, pd_type,
@@ -1518,6 +1527,13 @@ def _synthesize_eagle3_trace(
             f"Profile metadata for {hardware}/{model}/{variant} does not "
             "declare an EAGLE3 profile. Run python -m profiler eagle3."
         )
+    stage = getattr(batch, "speculative_stage", None)
+    table_name = "eagle3_seed" if stage == "eagle3_seed" else "eagle3"
+    if table_name == "eagle3_seed" and not profile.get("seed_table"):
+        raise KeyError(
+            f"Profile metadata for {hardware}/{model}/{variant} predates "
+            "EAGLE3 seed profiling. Re-run python -m profiler eagle3."
+        )
     requested_draft = getattr(batch, "eagle3_draft_model", None)
     profiled_draft = profile.get("draft_model")
     if requested_draft and profiled_draft != requested_draft:
@@ -1530,11 +1546,13 @@ def _synthesize_eagle3_trace(
     kv_len = int(batch.eagle3_kv_len)
     proposal_len = int(batch.eagle3_num_speculative_tokens)
     latency_ns = _lookup_eagle3(
-        ctx.perf_db, ctx.tp_size, batch_size, kv_len, proposal_len)
+        ctx.perf_db, ctx.tp_size, batch_size, kv_len, proposal_len,
+        table_name=table_name)
 
     logger.info(
-        "Batch #%d: EAGLE3 model=%s draft=%s num_reqs=%d kv_len=%d k=%d",
-        batch.batch_id, model, profiled_draft, batch_size, kv_len, proposal_len,
+        "Batch #%d: EAGLE3 phase=%s model=%s draft=%s num_reqs=%d kv_len=%d k=%d",
+        batch.batch_id, "seed" if stage == "eagle3_seed" else "iteration",
+        model, profiled_draft, batch_size, kv_len, proposal_len,
         extra={"node_id": node_id, "instance_id": instance_id},
     )
 
@@ -1614,7 +1632,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    if getattr(batch, "speculative_stage", None) == "eagle3":
+    if getattr(batch, "speculative_stage", None) in (
+            "eagle3_seed", "eagle3"):
         if enable_attn_offloading or enable_sub_batch_interleaving:
             raise ValueError(
                 "EAGLE3 aggregate profiles do not support attention offloading "

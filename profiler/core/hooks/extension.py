@@ -136,7 +136,7 @@ class Extension:
         shot_dict: dict[str, Any],
         iterations: int = 3,
     ) -> dict[str, float]:
-        """Measure one native verify+sample+next-proposal EAGLE3 iteration."""
+        """Measure EAGLE3's initial proposal and steady-state iteration."""
         import torch
 
         spec_config = getattr(self.model_runner, "speculative_config", None)
@@ -157,6 +157,7 @@ class Extension:
         sequence = int(getattr(self, "_eagle3_profile_sequence", 0))
         live_req_ids = list(getattr(self, "_eagle3_profile_live_req_ids", []))
         elapsed_ms = []
+        seed_elapsed_ms = []
 
         def _execute(scheduler_output):
             output = self.model_runner.execute_model(scheduler_output)
@@ -178,7 +179,33 @@ class Extension:
                 request_prefix=request_prefix,
                 finished_req_ids=live_req_ids,
             )
-            _execute(seed)
+            # The regular layerwise profile already models the target prefill
+            # and sampler. Time only the native EAGLE proposal launched after
+            # that sampler so the simulator can add the missing initial draft
+            # without double-counting target-model work.
+            proposal_times = []
+            original_propose = self.model_runner.propose_draft_token_ids
+
+            def _timed_propose(*args, **kwargs):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                result = original_propose(*args, **kwargs)
+                end.record()
+                end.synchronize()
+                proposal_times.append(float(start.elapsed_time(end)))
+                return result
+
+            self.model_runner.propose_draft_token_ids = _timed_propose
+            try:
+                _execute(seed)
+            finally:
+                self.model_runner.propose_draft_token_ids = original_propose
+            if len(proposal_times) != 1:
+                raise RuntimeError(
+                    "Expected exactly one EAGLE3 proposal during the seed step, "
+                    f"but observed {len(proposal_times)}."
+                )
             draft_rows, draft_req_ids = self.model_runner._get_draft_token_ids_cpu()
             draft_by_req = {
                 req_id: list(tokens[:num_speculative_tokens])
@@ -207,11 +234,15 @@ class Extension:
             # the next request set reuses its staging buffer.
             self.model_runner._get_draft_token_ids_cpu()
             if measurement_idx > 0:
+                seed_elapsed_ms.append(proposal_times[0])
                 elapsed_ms.append(measured_ms)
             live_req_ids = req_ids
 
         self._eagle3_profile_sequence = sequence
         self._eagle3_profile_live_req_ids = live_req_ids
         return {
+            "seed_microseconds": (
+                sum(seed_elapsed_ms) * 1000.0 / len(seed_elapsed_ms)
+            ),
             "microseconds": sum(elapsed_ms) * 1000.0 / len(elapsed_ms),
         }
