@@ -18,9 +18,15 @@ class Router:
         self.prefill_instances = len(self.prefill_schedulers)
         self.decode_schedulers = [s for s in schedulers if s.pd_type == "decode"]
         self.speculative_draft_schedulers = [
-            s for s in schedulers if s.speculative_decoding and s.speculative_role == 'draft']
+            s for s in schedulers
+            if s.speculative_decoding
+            and s.speculative_role in ('draft', 'colocated')
+        ]
         self.speculative_target_schedulers = [
-            s for s in schedulers if s.speculative_decoding and s.speculative_role == 'target']
+            s for s in schedulers
+            if s.speculative_decoding
+            and s.speculative_role in ('target', 'colocated')
+        ]
         self.eagle3_schedulers = [
             s for s in schedulers if s.speculative_decoding and s.speculative_role == 'eagle3']
         self.decode_instances = len(self.decode_schedulers)
@@ -167,8 +173,35 @@ class Router:
             return candidates[self._select_instance(candidates, 'prefill')]
         if self.speculative_draft_schedulers and self.speculative_target_schedulers:
             # The workload's model_name describes the served target model;
-            # speculative admission always begins on a draft-role instance.
+            # speculative admission always begins with draft prefill.
             candidates = self.speculative_draft_schedulers
+            if all(s.speculative_role == 'colocated' for s in candidates):
+                instance_id = req_data.get('instance_id')
+                model_name = req_data.get('model_name')
+                if instance_id is not None:
+                    idx = int(instance_id)
+                    if idx < 0 or idx >= len(self.schedulers):
+                        raise IndexError(
+                            f"Requested instance_id {idx} for request "
+                            f"{req_data.get('index')} is out of range"
+                        )
+                    scheduler = self.schedulers[idx]
+                    if scheduler not in candidates:
+                        raise ValueError(
+                            f"Requested instance_id {idx} is not a colocated "
+                            "speculative instance"
+                        )
+                    candidates = [scheduler]
+                if model_name is not None:
+                    candidates = [
+                        scheduler for scheduler in candidates
+                        if scheduler.model == model_name
+                    ]
+                if not candidates:
+                    raise LookupError(
+                        "No colocated speculative scheduler matches target "
+                        f"model {model_name!r}"
+                    )
             return candidates[self._select_instance(candidates, 'prefill')]
         candidates = self.prefill_schedulers if route_to == 'prefill' else self.decode_schedulers
         if not candidates:

@@ -231,8 +231,14 @@ def _resolve_speculative_roles(instances, runtime_configs):
     if eagle3 and classic:
         raise ValueError(
             "Do not mix EAGLE3 and draft-model speculative instances in one run.")
+    valid_classic_roles = {None, "draft", "target", "colocated"}
     for i in classic:
         role = runtime_configs[i].get("speculative_role")
+        if role not in valid_classic_roles:
+            raise ValueError(
+                "Draft-model speculative_role must be draft, target, or "
+                "colocated."
+            )
         if role is None:
             pd_type = instances[i].get("pd_type")
             if pd_type == "prefill":
@@ -241,21 +247,45 @@ def _resolve_speculative_roles(instances, runtime_configs):
                 role = "target"
         runtime_configs[i]["speculative_role"] = role
 
-    missing = [i for i in classic if runtime_configs[i]["speculative_role"] is None]
-    assigned = {runtime_configs[i]["speculative_role"] for i in classic} - {None}
-    if len(missing) == 2 and not assigned:
+    missing = [
+        i for i in classic
+        if runtime_configs[i]["speculative_role"] is None
+    ]
+    assigned = {
+        runtime_configs[i]["speculative_role"] for i in classic
+    } - {None}
+    if len(classic) == 1 and len(missing) == 1:
+        runtime_configs[missing[0]]["speculative_role"] = "colocated"
+    elif len(missing) == 2 and not assigned:
         runtime_configs[missing[0]]["speculative_role"] = "draft"
         runtime_configs[missing[1]]["speculative_role"] = "target"
     elif len(missing) == 1 and assigned in ({"draft"}, {"target"}):
         runtime_configs[missing[0]]["speculative_role"] = (
             "target" if "draft" in assigned else "draft")
     elif missing:
-        raise ValueError("Set speculative_role to draft or target on each draft-model instance.")
+        raise ValueError(
+            "Set speculative_role to draft, target, or colocated on each "
+            "draft-model instance."
+        )
 
     roles = {runtime_configs[i]["speculative_role"] for i in classic}
-    if classic and roles != {"draft", "target"}:
+    if "colocated" in roles:
+        if roles != {"colocated"}:
+            raise ValueError(
+                "Do not mix colocated and separate draft/target speculative "
+                "roles in one run."
+            )
+        for i in classic:
+            if not runtime_configs[i].get("speculative_draft_model"):
+                raise ValueError(
+                    "Colocated draft-model speculative decoding requires "
+                    "speculative_draft_model."
+                )
+    elif classic and roles != {"draft", "target"}:
         raise ValueError(
-            "Draft-model speculative decoding requires at least one draft and one target instance.")
+            "Draft-model speculative decoding requires either colocated "
+            "instances or at least one draft and one target instance."
+        )
 
 
 def _resolve_trace_paths(runtime_configs, launch_cwd):
@@ -367,12 +397,12 @@ def main():
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
     parser.add_argument('--speculative-decoding', action=argparse.BooleanOptionalAction, default=False,
-                        help='enable speculative decoding with separate draft and target scheduler roles')
+                        help='enable colocated or separate-instance speculative decoding')
     parser.add_argument('--speculative-method', type=str, choices=['draft_model', 'eagle3'],
                         default='draft_model',
                         help='speculative method: independent draft_model or colocated native eagle3')
     parser.add_argument('--speculative-draft-model', type=str, default=None,
-                        help='target-specific EAGLE3 draft head identifier recorded in profile metadata')
+                        help='draft model for colocated draft_model decoding, or EAGLE3 head identifier')
     parser.add_argument('--speculative-draft-length', type=int, default=4,
                         help='number of draft tokens to generate before verification')
     parser.add_argument('--speculative-acceptance-model', type=str, choices=['constant', 'random', 'trace'],
@@ -699,8 +729,8 @@ def main():
                 router.notify_request_completed(req.id, current)
 
         for req in final_reqs:
-            draft_inst = getattr(req, "speculative_draft_instance_id", None)
-            if draft_inst is not None and draft_inst != instance_id:
+            draft_inst = req.speculative_draft_instance_id
+            if draft_inst is not None:
                 schedulers[draft_inst].release_speculative_draft(req)
 
         # Add prefill ended requests to decode instance

@@ -55,16 +55,32 @@ class Scheduler:
         self.speculative_role = speculative_role.lower() if isinstance(speculative_role, str) else speculative_role
         if self.speculative_decoding and self.speculative_role is None:
             raise ValueError("speculative decoding requires a scheduler role")
-        if self.speculative_role not in (None, 'draft', 'target', 'eagle3'):
+        if self.speculative_role not in (
+                None, 'draft', 'target', 'colocated', 'eagle3'):
             raise ValueError(
                 f"Unsupported speculative_role {speculative_role!r}. "
-                "Expected draft, target, eagle3, or None.")
+                "Expected draft, target, colocated, eagle3, or None.")
         if (self.speculative_decoding and self.speculative_method == 'eagle3'
                 and self.speculative_role != 'eagle3'):
             raise ValueError("EAGLE3 requires speculative_role='eagle3'.")
         if (self.speculative_decoding and self.speculative_method == 'eagle3'
                 and not self.speculative_draft_model):
             raise ValueError("EAGLE3 requires speculative_draft_model.")
+        if (self.speculative_decoding and self.speculative_method == 'draft_model'
+                and self.speculative_role == 'colocated'
+                and not self.speculative_draft_model):
+            raise ValueError(
+                "Colocated draft-model speculative decoding requires "
+                "speculative_draft_model."
+            )
+        self.speculative_draft_config = None
+        if self.speculative_role == 'colocated':
+            self.speculative_draft_config = get_config(
+                self.speculative_draft_model)
+            self.max_num_batched_tokens = min(
+                self.max_num_batched_tokens,
+                self.speculative_draft_config['max_position_embeddings'],
+            )
         self.speculative_draft_length = max(1, int(speculative_draft_length)) if self.speculative_decoding else 0
         if (self.speculative_decoding and self.speculative_method == 'eagle3'
                 and self.max_num_batched_tokens < self.speculative_draft_length + 1):
@@ -76,7 +92,7 @@ class Scheduler:
                 acceptance_rate=speculative_acceptance_rate,
                 trace_path=speculative_acceptance_trace,
                 seed=42,
-            ) if self.speculative_decoding and self.speculative_role in ('target', 'eagle3') else None
+            ) if self.speculative_decoding and self.speculative_role in ('target', 'colocated', 'eagle3') else None
         )
 
         # lists are sorted in arrival time manner
@@ -86,14 +102,48 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, self.enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
+        additional_models = (
+            [self.speculative_draft_model]
+            if self.speculative_decoding and self.speculative_role == 'colocated'
+            else None
+        )
+        self.memory = MemoryModel(
+            model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem,
+            block_size, fp, self.enable_prefix_caching, enable_prefix_sharing,
+            prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size,
+            pp_size=pp_size, kv_cache_dtype=kv_cache_dtype,
+            additional_models=additional_models,
+        )
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
-    
- 
+
+    def _speculative_model_for_stage(self, stage):
+        if (self.speculative_role == 'colocated'
+                and stage in ('draft_prefill', 'draft', 'draft_sync')):
+            return self.speculative_draft_model
+        return self.model
+
+    def _adjust_speculative_tokens(self, current_tokens, new_tokens, model):
+        if self.speculative_role == 'colocated':
+            self.memory.adjust_tokens(
+                current_tokens, new_tokens, Device.NPU, model=model)
+        else:
+            self.memory.adjust_tokens(
+                current_tokens, new_tokens, Device.NPU)
+
+    @staticmethod
+    def _commit_speculative_first_token(req, finish):
+        if not req.speculative_first_commit_pending:
+            return 0
+        req.set_ttft(finish)
+        req.is_init = False
+        req.speculative_first_commit_pending = False
+        return 1
+
     def schedule(self, current, sys, batch_id=-1):
-        if self.speculative_decoding and self.speculative_role == 'target':
+        if (self.speculative_decoding
+                and self.speculative_role in ('target', 'colocated')):
             batch = self.schedule_speculative_verify(current, sys, batch_id)
             if batch is not None:
                 return batch
@@ -257,7 +307,7 @@ class Scheduler:
         return batch
 
     def schedule_speculative_verify(self, current, sys, batch_id=-1):
-        if self.speculative_role != 'target':
+        if self.speculative_role not in ('target', 'colocated'):
             return None
         if sys == self.start_npu:
             if len(self.request) != 0 and self.request[0].arrival > current:
@@ -322,7 +372,7 @@ class Scheduler:
             for req in batch_req:
                 chunk_size = scheduled_tokens[req.id]
                 total_len += chunk_size
-                if req.is_init:
+                if req.is_init and req.queuing_delay < 0:
                     req.set_que_delay(current)
                 q_list.append(chunk_size)
                 prefill_q_list.append(chunk_size)
@@ -358,11 +408,11 @@ class Scheduler:
         )
         return batch
 
-    def _get_reload_size(self, batch_req, batch_len):
+    def _get_reload_size(self, batch_req, batch_len, model=None):
         load_size = 0
         for req in batch_req[:batch_len]:
             if req.evict:
-                load_size += self.memory.get_evict_kv(req)
+                load_size += self.memory.get_evict_kv(req, model=model)
         return load_size
 
     # batch the request scheduling method
@@ -379,6 +429,15 @@ class Scheduler:
 
             # scheduling start
             batch_req = [req for req in self.request if req.arrival <= current]
+            batch_model = self.model
+            if self.speculative_role == 'colocated' and batch_req:
+                batch_model = self._speculative_model_for_stage(
+                    batch_req[0].speculative_stage)
+                batch_req = [
+                    req for req in batch_req
+                    if self._speculative_model_for_stage(
+                        req.speculative_stage) == batch_model
+                ]
 
             # max_num_seqs limits total running requests (vLLM behavior)
             running_reqs = sum(len(b.requests) for b in self.inflight)
@@ -482,8 +541,10 @@ class Scheduler:
             # ============ STEP 2: KV size calculation (with scheduled_tokens) ============
             temp_len = batch_len
             for i in range(batch_len, -1, -1):
-                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                load_size = self._get_reload_size(batch_req, i)
+                kv_size = self.memory.get_block_kv(
+                    batch_req, i, scheduled_tokens, model=batch_model)
+                load_size = self._get_reload_size(
+                    batch_req, i, model=batch_model)
                 if self.memory.is_avail(kv_size + load_size, Device.NPU):
                     temp_len = i
                     break
@@ -502,7 +563,8 @@ class Scheduler:
 
                 # else
                 req_to_evict = gen_req[-1]
-                evicted_kv_size = self.memory.get_evict_kv(req_to_evict)
+                evicted_kv_size = self.memory.get_evict_kv(
+                    req_to_evict, model=batch_model)
                 evict_size += evicted_kv_size
                 req_to_evict.evict = True
                 self.logger.info("Eviction of the request #%d", req_to_evict.id)
@@ -519,8 +581,10 @@ class Scheduler:
 
                 # check if can batch
                 for i in range(batch_len, -1, -1):
-                    kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    load_size = self._get_reload_size(batch_req, i)
+                    kv_size = self.memory.get_block_kv(
+                        batch_req, i, scheduled_tokens, model=batch_model)
+                    load_size = self._get_reload_size(
+                        batch_req, i, model=batch_model)
                     if self.memory.is_avail(kv_size + load_size, Device.NPU):
                         temp_len = i
                         break
@@ -529,8 +593,10 @@ class Scheduler:
             batch_req = batch_req[:batch_len]
 
             # Recompute kv_size for final batch
-            kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
-            load_size = self._get_reload_size(batch_req, batch_len)
+            kv_size = self.memory.get_block_kv(
+                batch_req, batch_len, scheduled_tokens, model=batch_model)
+            load_size = self._get_reload_size(
+                batch_req, batch_len, model=batch_model)
 
             # delete from request queue
             for req in batch_req:
@@ -569,7 +635,7 @@ class Scheduler:
                     chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
 
                     total_len += chunk_size
-                    if req.is_init:  # Only set queuing delay on first chunk
+                    if req.is_init and req.queuing_delay < 0:
                         req.set_que_delay(current)
                     q_list.append(chunk_size)
                     prefill_q_list.append(chunk_size)
@@ -590,7 +656,12 @@ class Scheduler:
 
             # make batch, output doesn't matter here!! always one iteration
             # batch is also 1
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
+            batch = Batch(
+                self.get_batch_id(), batch_model, total_len, kv_len, q_list,
+                k_list, num_prefill, num_decode, prefill_q_list,
+                prefill_k_list, decode_k_list, current, kv_size, evict_size,
+                load_size,
+            )
             # add already fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
@@ -604,8 +675,13 @@ class Scheduler:
             # batch.log()
             # add scheduled_tokens to batch for debugging
             batch.scheduled_tokens = scheduled_tokens
-            if self.speculative_decoding and self.speculative_role == 'draft':
+            if (self.speculative_decoding
+                    and (self.speculative_role == 'draft'
+                         or (self.speculative_role == 'colocated'
+                             and batch_model == self.speculative_draft_model))):
                 batch.speculative_stage = 'draft'
+            elif self.speculative_role == 'colocated':
+                batch.speculative_stage = 'target_prefill'
             return batch
         
         # Schedule already batched request
@@ -1087,19 +1163,34 @@ class Scheduler:
             if self.speculative_decoding and req.speculative_stage == 'draft_sync':
                 req.num_computed_tokens += 1
                 req.speculative_draft_kv_tokens = req.num_computed_tokens
-                req.speculative_stage = 'draft'
-                pool.append(req)
+                req.speculative_draft_generated = 1
+                if (req.speculative_draft_generated
+                        >= req.speculative_draft_tokens):
+                    req.speculative_stage = 'verify'
+                    req.speculative_verify_tokens = (
+                        req.speculative_draft_tokens + 1)
+                    req.num_computed_tokens = (
+                        req.speculative_target_kv_tokens)
+                    gen_t += self._commit_speculative_first_token(
+                        req, finish)
+                    transfer_reqs.append(req)
+                else:
+                    req.speculative_stage = 'draft'
+                    pool.append(req)
                 continue
 
             # Speculative draft step: one decode token on the draft model.
             if self.speculative_decoding and batch_stage == 'draft' and req.speculative_stage == 'draft':
                 req.num_computed_tokens += 1
-                draft_generated = req.num_computed_tokens - req.speculative_target_tokens
-                if draft_generated >= req.speculative_draft_tokens:
+                req.speculative_draft_generated += 1
+                if (req.speculative_draft_generated
+                        >= req.speculative_draft_tokens):
                     req.speculative_draft_kv_tokens = req.num_computed_tokens
                     req.speculative_stage = 'verify'
                     req.speculative_verify_tokens = req.speculative_draft_tokens + 1
-                    req.num_computed_tokens = req.speculative_target_tokens
+                    req.num_computed_tokens = req.speculative_target_kv_tokens
+                    gen_t += self._commit_speculative_first_token(
+                        req, finish)
                     transfer_reqs.append(req)
                 else:
                     pool.append(req)
@@ -1107,7 +1198,8 @@ class Scheduler:
 
             # Speculative verification step: mini-prefill on the target model.
             if self.speculative_decoding and req.speculative_stage == 'verify':
-                base_tokens = req.speculative_target_tokens
+                base_tokens = int(req.speculative_target_tokens)
+                computed_before = int(req.speculative_target_kv_tokens)
                 verify_tokens = max(1, int(req.speculative_verify_tokens or (req.speculative_draft_tokens + 1)))
                 accepted = self.speculative_acceptance_model.sample(
                     request=req,
@@ -1119,17 +1211,21 @@ class Scheduler:
                 req.speculative_accept_tokens = accepted
                 gen_t += accepted + 1
 
-                # Roll the target KV cache back from the full verify window to the
-                # accepted prefix plus the target token.
-                self.memory.adjust_tokens(base_tokens + verify_tokens, committed, Device.NPU)
-                req.num_computed_tokens = committed
+                # The last committed target token has been sampled but has not
+                # entered KV yet. Keep the accepted prefix and roll back the
+                # rest of the full verification window.
+                retained_kv_tokens = committed - 1
+                self._adjust_speculative_tokens(
+                    computed_before + verify_tokens,
+                    retained_kv_tokens,
+                    self.model,
+                )
+                req.num_computed_tokens = retained_kv_tokens
                 req.speculative_target_tokens = committed
-                req.speculative_target_kv_tokens = committed
-
-                if req.speculative_first_commit_pending:
-                    req.set_ttft(finish)
-                    req.speculative_first_commit_pending = False
-                    req.is_init = False
+                req.speculative_target_kv_tokens = retained_kv_tokens
+                req.add_itl(finish)
+                if accepted:
+                    req.itl.extend([0] * accepted)
 
                 req.speculative_iteration += 1
                 if committed >= req.output:
@@ -1157,7 +1253,7 @@ class Scheduler:
                         pool.append(req)
                     else:
                         req.speculative_stage = 'draft_sync'
-                        req.num_computed_tokens = base_tokens + accepted
+                        req.speculative_draft_generated = 0
                         transfer_reqs.append(req)
                 continue
 
@@ -1192,44 +1288,72 @@ class Scheduler:
                     pool.append(req)
                     continue
 
+                # Independent draft models prefill their own prompt KV, but
+                # those tokens are internal work and must not be counted as
+                # user prompt throughput. The target prefill owns prompt
+                # throughput; the initial draft proposal owns TTFT.
+                if (self.speculative_decoding
+                        and self.speculative_role in ('draft', 'colocated')
+                        and req.speculative_stage == 'draft_prefill'):
+                    if req.num_computed_tokens < req.original_input:
+                        pool.append(req)
+                        continue
+                    req.speculative_active = True
+                    req.speculative_draft_kv_tokens = req.num_computed_tokens
+                    req.speculative_stage = 'target_prefill'
+                    req.num_computed_tokens = 0
+                    req.speculative_draft_generated = 0
+                    req.speculative_verify_tokens = 0
+                    req.speculative_accept_tokens = 0
+                    req.speculative_draft_instance_id = self.instance_id
+                    transfer_reqs.append(req)
+                    continue
 
-                if (self.speculative_decoding and self.speculative_role == 'target'
+                if (self.speculative_decoding
+                        and self.speculative_role in ('target', 'colocated')
                         and req.speculative_stage == 'target_prefill'):
                     prompt_t += chunk_len
                     if req.num_computed_tokens < req.original_input:
                         pool.append(req)
                         continue
-                    req.speculative_target_tokens = req.num_computed_tokens
+                    # Target prefill samples the first output token. It remains
+                    # pending until the initial draft proposal is ready, while
+                    # target KV still contains only the prompt.
+                    req.speculative_target_tokens = min(
+                        req.output, req.num_computed_tokens + 1)
                     req.speculative_target_kv_tokens = req.num_computed_tokens
                     req.speculative_first_commit_pending = True
                     req.speculative_iteration = 0
-                    remaining = req.output - req.num_computed_tokens
+                    req.speculative_draft_generated = 0
+
+                    if req.speculative_target_tokens >= req.output:
+                        gen_t += self._commit_speculative_first_token(
+                            req, finish)
+                        kv_size = self.memory.get_evict_kv(req)
+                        self.memory.free(kv_size, Device.NPU)
+                        req.add_latency(finish)
+                        req.speculative_stage = None
+                        req.speculative_target_kv_tokens = 0
+                        self.done.append(req)
+                        final_reqs.append(req)
+                        continue
+
+                    remaining = req.output - req.speculative_target_tokens
                     verify_cap = max(0, int(self.max_num_batched_tokens) - 1)
                     req.speculative_draft_tokens = min(
                         self.speculative_draft_length, verify_cap, max(0, remaining - 1))
                     req.speculative_verify_tokens = req.speculative_draft_tokens + 1
                     if req.speculative_draft_tokens == 0:
+                        gen_t += self._commit_speculative_first_token(
+                            req, finish)
                         req.speculative_stage = 'verify'
                         pool.append(req)
                     else:
-                        req.speculative_stage = 'draft'
+                        req.speculative_stage = 'draft_sync'
                         transfer_reqs.append(req)
                     continue
                 # Check if prefill is complete
                 if req.num_computed_tokens >= req.original_input:
-                    if (self.speculative_decoding and self.speculative_role == 'draft'
-                            and req.speculative_stage == 'draft_prefill'):
-                        req.is_init = False
-                        req.speculative_active = True
-                        req.speculative_draft_kv_tokens = req.num_computed_tokens
-                        req.speculative_stage = 'target_prefill'
-                        req.num_computed_tokens = 0
-                        req.speculative_verify_tokens = 0
-                        req.speculative_accept_tokens = 0
-                        req.speculative_draft_instance_id = self.instance_id
-                        transfer_reqs.append(req)
-                        continue
-
                     # Update prefix cache before clearing is_init (for stats tracking)
                     if self.enable_prefix_caching:
                         self.memory.cache_unfinished_req(req, Device.NPU)
@@ -1282,12 +1406,13 @@ class Scheduler:
                 if self.speculative_decoding and req.speculative_stage == 'draft':
                     # Draft tokens are internal speculative work, not committed output.
                     req.num_computed_tokens += 1
-                    draft_generated = req.num_computed_tokens - req.speculative_target_tokens
-                    if draft_generated >= req.speculative_draft_tokens:
+                    req.speculative_draft_generated += 1
+                    if (req.speculative_draft_generated
+                            >= req.speculative_draft_tokens):
                         req.speculative_draft_kv_tokens = req.num_computed_tokens
                         req.speculative_stage = 'verify'
                         req.speculative_verify_tokens = req.speculative_draft_tokens + 1
-                        req.num_computed_tokens = req.speculative_target_tokens
+                        req.num_computed_tokens = req.speculative_target_kv_tokens
                         transfer_reqs.append(req)
                         continue
                     pool.append(req)
@@ -1346,10 +1471,14 @@ class Scheduler:
         else:
             new_req = Request(*(req), is_init=is_init, session_id=session_id, sub_request_index=sub_request_index)
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
-        if self.speculative_decoding and self.speculative_role == 'draft' and new_req.speculative_stage is None:
+        if (self.speculative_decoding
+                and self.speculative_role in ('draft', 'colocated')
+                and new_req.speculative_stage is None):
             new_req.speculative_active = True
             new_req.speculative_stage = 'draft_prefill'
             new_req.speculative_draft_instance_id = self.instance_id
+            if self.speculative_role == 'colocated':
+                new_req.speculative_target_instance_id = self.instance_id
             new_req.is_init = True
         elif (self.speculative_decoding and self.speculative_role == 'eagle3'
               and new_req.speculative_stage is None):
@@ -1364,16 +1493,20 @@ class Scheduler:
     def add_decode(self, req):
         req.instance_id = self.instance_id
         req.model = self.model
-        self.request.append(req)
+        bisect.insort(self.request, req, key=lambda r: (r.arrival, r.id))
         if self.speculative_decoding and req.speculative_stage in ('draft', 'draft_sync'):
-            current_tokens = int(getattr(req, 'speculative_draft_kv_tokens', 0) or 0)
+            current_tokens = int(req.speculative_draft_kv_tokens or 0)
             new_tokens = int(req.num_computed_tokens)
-            self.memory.adjust_tokens(current_tokens, new_tokens, Device.NPU)
+            self._adjust_speculative_tokens(
+                current_tokens, new_tokens,
+                self._speculative_model_for_stage(req.speculative_stage),
+            )
             req.speculative_draft_kv_tokens = new_tokens
         elif self.speculative_decoding and req.speculative_stage in ('verify', 'target_prefill'):
             current_tokens = int(req.speculative_target_kv_tokens or 0)
             new_tokens = int(req.num_computed_tokens)
-            self.memory.adjust_tokens(current_tokens, new_tokens, Device.NPU)
+            self._adjust_speculative_tokens(
+                current_tokens, new_tokens, self.model)
             req.speculative_target_kv_tokens = new_tokens
         elif self.enable_prefix_caching:
             self.memory.prefix_match(req)
@@ -1391,7 +1524,10 @@ class Scheduler:
             return
         current_tokens = int(req.speculative_draft_kv_tokens or 0)
         if current_tokens > 0:
-            self.memory.adjust_tokens(current_tokens, 0, Device.NPU)
+            self._adjust_speculative_tokens(
+                current_tokens, 0,
+                self._speculative_model_for_stage('draft'),
+            )
         req.speculative_draft_kv_tokens = 0
     
     # get first request's arrival time

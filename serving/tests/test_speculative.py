@@ -71,6 +71,61 @@ class SpeculativeRoleInferenceTest(unittest.TestCase):
             ['draft', 'target'],
         )
 
+    def test_single_instance_is_inferred_as_colocated(self):
+        source = Path('serving/__main__.py').read_text(encoding='utf-8')
+        module = ast.parse(source)
+        function = next(
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == '_resolve_speculative_roles'
+        )
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                '<roles>',
+                'exec',
+            ),
+            namespace,
+        )
+        instances = [{'pd_type': None}]
+        configs = [{
+            'speculative_decoding': True,
+            'speculative_role': None,
+            'speculative_draft_model': 'draft-model',
+        }]
+
+        namespace['_resolve_speculative_roles'](instances, configs)
+
+        self.assertEqual(configs[0]['speculative_role'], 'colocated')
+
+    def test_colocated_instance_requires_draft_model(self):
+        source = Path('serving/__main__.py').read_text(encoding='utf-8')
+        module = ast.parse(source)
+        function = next(
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == '_resolve_speculative_roles'
+        )
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                '<roles>',
+                'exec',
+            ),
+            namespace,
+        )
+        instances = [{'pd_type': None}]
+        configs = [{
+            'speculative_decoding': True,
+            'speculative_role': None,
+            'speculative_draft_model': None,
+        }]
+
+        with self.assertRaisesRegex(ValueError, 'speculative_draft_model'):
+            namespace['_resolve_speculative_roles'](instances, configs)
+
     def test_eagle3_role_is_colocated(self):
         source = Path('serving/__main__.py').read_text(encoding='utf-8')
         module = ast.parse(source)
@@ -99,6 +154,28 @@ class SpeculativeRouterTest(unittest.TestCase):
         self.draft = _FakeScheduler(0, 'draft', 'draft-model')
         self.target = _FakeScheduler(1, 'target', 'target-model')
         self.router = Router(2, [self.draft, self.target], req_num=0)
+
+    def test_colocated_instance_handles_both_stages(self):
+        colocated = _FakeScheduler(0, 'colocated', 'target-model')
+        router = Router(1, [colocated], req_num=0)
+        selected = router._select_scheduler_for_request({
+            'index': 0,
+            'route_to': 'prefill',
+            'model_name': 'target-model',
+        })
+        self.assertIs(selected, colocated)
+
+        request = type('RequestStub', (), {
+            'id': 9,
+            'speculative_stage': 'target_prefill',
+            'speculative_target_instance_id': 0,
+            'speculative_draft_instance_id': 0,
+        })()
+        router.transfer_speculative_requests([request])
+        request.speculative_stage = 'draft_sync'
+        router.transfer_speculative_requests([request])
+
+        self.assertEqual(colocated.request, [request, request])
 
     def test_pd_null_request_starts_on_draft_role(self):
         selected = self.router._select_scheduler_for_request({

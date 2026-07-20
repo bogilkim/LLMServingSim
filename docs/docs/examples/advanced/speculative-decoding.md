@@ -7,7 +7,12 @@ title: Speculative decoding
 
 ## Independent draft model
 
-Speculative decoding uses a draft instance to propose tokens and a target instance to verify them. Both instances execute the prompt prefill. After each verification, rejected draft KV is rolled back and the draft model executes the target-produced token before proposing again.
+Speculative decoding uses a draft model to propose tokens and a target model
+to verify them. Both models execute the prompt prefill. The target prefill
+samples the first output token, and the initial draft proposal completes before
+that token is returned and defines TTFT. After each verification, rejected
+draft KV is rolled back and the draft model executes the target-produced token
+before proposing again.
 
 Use the included two-instance example:
 
@@ -19,6 +24,13 @@ python -m serving \
 ```
 
 Each participating instance sets `speculative_decoding: true` and has an explicit `speculative_role` of `draft` or `target`. For a two-instance configuration with `pd_type: null`, roles can also be inferred by order: draft first, target second. Explicit roles are recommended.
+
+A single independent-draft instance is inferred as
+`speculative_role: colocated`. Set `speculative_draft_model` to the draft model
+identifier. The instance loads both weight sets and uses the target instance's
+hardware and TP
+degree to resolve both profile bundles. Draft and target batches remain
+separate so each stage uses its own latency table and KV shape.
 
 The target instance controls these settings:
 
@@ -32,6 +44,31 @@ Trace rows use `request_id`, `iteration`, and `accepted_tokens`. A missing reque
 Speculative KV uses separate raw ownership for the draft and target models. Prefix caching is therefore disabled on speculative instances even if enabled globally; this avoids representing two model-specific KV copies in the single-request radix-cache state.
 
 The target token budget must accommodate verification. The simulator caps the proposal length to `max_num_batched_tokens - 1`, reserving one position for the target-produced token. If even one verification request cannot fit in target KV memory, the run fails with a clear error instead of stalling.
+
+### Interpreting TTFT and ITL
+
+Independent-draft prompt prefills are currently serialized on the request's
+critical path: draft prefill, then target prefill. Speculative decoding is a
+steady-state decode optimization, so TTFT can be worse than autoregressive
+decoding even when TPOT and mean ITL improve.
+
+For proposal length `k`, a steady-state round costs approximately:
+
+```text
+k * draft_decode + target_verify(k + 1)
+```
+
+The round commits the accepted prefix plus one target token. A configuration
+only speeds up decode when that cost is lower than the same number of target
+autoregressive decode steps. A draft model that is too large, a low acceptance
+rate, or an undersized request batch can therefore make speculative decoding
+slower.
+
+All tokens committed by one verification become visible at the same simulated
+completion time. ITL records the elapsed interval for the first token in that
+burst and zero for the remaining tokens; mean ITL and TPOT therefore retain
+the burst's amortized latency.
+
 ## EAGLE3
 
 EAGLE3 uses one colocated target instance and a target-specific EAGLE3

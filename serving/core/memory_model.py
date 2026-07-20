@@ -14,7 +14,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', additional_models=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -32,24 +32,53 @@ class MemoryModel():
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
 
-        self.config = get_config(model)
-        self.n_embd = self.config['hidden_size']
-        self.n_layer = self.config['num_hidden_layers']
-        self.n_head = self.config['num_attention_heads']
-        self.head_dim = self.config.get('head_dim', self.n_embd // self.n_head)
-        self.kv_head = self.config.get("num_key_value_heads", self.n_head)  # fallback to n_head if not defined
-        self.q_dim = self.n_head * self.head_dim       # total Q projection output dim
-        self.kv_dim = self.kv_head * self.head_dim     # total KV projection output dim
-        self.vocab_size = self.config['vocab_size']
-        # Accept either the Mistral-style ``num_local_experts`` or the
-        # HF/Qwen-style ``num_experts`` key — profiler configs track
-        # upstream HF naming which varies per family.
-        self.is_moe = 'num_local_experts' in self.config or 'num_experts' in self.config
-
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
-        # Memory model
-        self.weight = self.get_weight() # assume weight is loaded
+        model_names = [model]
+        for additional_model in additional_models or []:
+            if additional_model and additional_model not in model_names:
+                model_names.append(additional_model)
+        self.model_configs = {
+            model_name: get_config(model_name) for model_name in model_names
+        }
+        self.config = self.model_configs[model]
+        self.model_specs = {}
+        for model_name, config in self.model_configs.items():
+            n_embd = config['hidden_size']
+            n_head = config['num_attention_heads']
+            head_dim = config.get('head_dim', n_embd // n_head)
+            kv_head = config.get("num_key_value_heads", n_head)
+            self.model_specs[model_name] = {
+                "n_embd": n_embd,
+                "n_layer": config['num_hidden_layers'],
+                "n_head": n_head,
+                "head_dim": head_dim,
+                "q_dim": n_head * head_dim,
+                "kv_dim": kv_head * head_dim,
+                "vocab_size": config['vocab_size'],
+                "is_moe": (
+                    'num_local_experts' in config or 'num_experts' in config
+                ),
+            }
+
+        # Preserve the target/default model attributes used by existing code.
+        default_spec = self.model_specs[model]
+        self.n_embd = default_spec["n_embd"]
+        self.n_layer = default_spec["n_layer"]
+        self.n_head = default_spec["n_head"]
+        self.head_dim = default_spec["head_dim"]
+        self.kv_head = self.config.get("num_key_value_heads", self.n_head)
+        self.q_dim = default_spec["q_dim"]
+        self.kv_dim = default_spec["kv_dim"]
+        self.vocab_size = default_spec["vocab_size"]
+        self.is_moe = default_spec["is_moe"]
+
+        # Colocated speculative decoding keeps both model weights resident on
+        # the same devices, so they consume one shared NPU capacity.
+        self.weight_by_model = {
+            model_name: self.get_weight(model_name) for model_name in model_names
+        }
+        self.weight = sum(self.weight_by_model.values())
         self.npu_used = self.weight
         self.cpu_used = 0
         if self.weight > self.npu_mem:
@@ -93,7 +122,7 @@ class MemoryModel():
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
-    def get_weight(self):
+    def get_weight(self, model=None):
         """Per-GPU model weight in bytes.
 
         Conservative upper bound across PP ranks: assumes a single rank
@@ -103,65 +132,70 @@ class MemoryModel():
         ranks are lighter — but using the heaviest-rank value here keeps
         the `weight > npu_mem` check safe.
         """
+        model = model or self.model
+        spec = self.model_specs[model]
         tp = self.tp_size
         pp = max(self.pp_size, 1)
         ep = self.ep_size
         fp = self.fp
         weight = 0
 
-        _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
+        _, embedding, _ = calculate_sizes(model, 'embedding', 1, parallel=tp, fp=fp)
         weight += embedding
-        weight += self._get_weight_per_block(tp, ep, fp) * (self.n_layer // pp)
-        _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp)
+        weight += self._get_weight_per_block(model, tp, ep, fp) * (spec["n_layer"] // pp)
+        _, ln_f, _ = calculate_sizes(model, 'final_layernorm', 1, parallel=tp, fp=fp)
         weight += ln_f
-        _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp)
+        _, lm_head, _ = calculate_sizes(model, 'lm_head', 1, parallel=tp, fp=fp)
         weight += lm_head
 
         self.logger.info(
-            "NPU: model weight %dMB loaded",
+            "NPU: model %s weight %dMB loaded",
+            model,
             weight * tp // MB_TO_BYTE,
         )
         return weight
 
-    def _get_weight_per_block(self, tp, ep, fp):
+    def _get_weight_per_block(self, model, tp, ep, fp):
         """Per-block weight: dense layers use TP, MoE experts use EP."""
         block_weight = 0
-        _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp)
+        _, ln_w, _ = calculate_sizes(model, 'layernorm', 1, parallel=tp, fp=fp)
         block_weight += ln_w  # input layernorm
-        _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp)
+        _, qkv_w, _ = calculate_sizes(model, 'qkv_proj', 1, parallel=tp, fp=fp)
         block_weight += qkv_w
-        _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
+        _, o_w, _ = calculate_sizes(model, 'o_proj', 1, parallel=tp, fp=fp)
         block_weight += o_w
         block_weight += ln_w  # post layernorm (same weight size)
-        if self.is_moe:
-            _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp)
+        if self.model_specs[model]["is_moe"]:
+            _, moe_w, _ = calculate_sizes(model, 'moe', 1, parallel=ep, fp=fp)
             block_weight += moe_w
         else:
-            _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp)
+            _, ffn1_w, _ = calculate_sizes(model, 'gate_up_proj', 1, parallel=tp, fp=fp)
             block_weight += ffn1_w
-            _, ffn2_w, _ = calculate_sizes(self.model, 'down_proj', 1, parallel=tp, fp=fp)
+            _, ffn2_w, _ = calculate_sizes(model, 'down_proj', 1, parallel=tp, fp=fp)
             block_weight += ffn2_w
         return block_weight
 
-    def get_kv(self, seq):
+    def get_kv(self, seq, model=None):
         # shape of kv cache
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
+        model = model or self.model
+        spec = self.model_specs[model]
         # K & V multiply 2
-        return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
-    
+        return 2 * spec["kv_dim"] * seq * spec["n_layer"] * self.kv_fp // self.num_npus
+
     # get the total size of current kv cache for the request
     # used when adding prefilled request to decode instance.
-    def get_total_kv(self, req):
+    def get_total_kv(self, req, model=None):
         # ceil division: (n + block_size - 1) // block_size
         num_blocks = (req.num_computed_tokens + self.block_size - 1) // self.block_size
-        return self.get_kv(num_blocks * self.block_size)
+        return self.get_kv(num_blocks * self.block_size, model=model)
 
-    def get_total_kv_tokens(self, tokens):
+    def get_total_kv_tokens(self, tokens, model=None):
         """Return the KV footprint for a raw token count."""
         num_blocks = (max(int(tokens), 0) + self.block_size - 1) // self.block_size
-        return self.get_kv(num_blocks * self.block_size)
+        return self.get_kv(num_blocks * self.block_size, model=model)
 
     # get size of kv block that should be 'added'. including new init requests
     # also checks evicted request and include its kv cache
@@ -171,7 +205,7 @@ class MemoryModel():
     #   blocks_after = ceil((computed + scheduled) / block_size)
     #   blocks_before = ceil(computed / block_size) if computed > 0 else 0
     #   new_blocks = blocks_after - blocks_before
-    def get_block_kv(self, batch_req, batch_len, scheduled_tokens=None):
+    def get_block_kv(self, batch_req, batch_len, scheduled_tokens=None, model=None):
         # print("[get_block_kv] current batch_req length : {}".format(batch_len))
         block_kv_size = 0
         for i in range(batch_len):
@@ -199,7 +233,7 @@ class MemoryModel():
                 blocks_before = (computed_before + self.block_size - 1) // self.block_size if computed_before > 0 else 0
 
                 new_blocks = max(0, blocks_after - blocks_before)
-                block_kv_size += self.get_kv(new_blocks * self.block_size)
+                block_kv_size += self.get_kv(new_blocks * self.block_size, model=model)
                 # print("[DEBUG] hit : {} | tokens_this_step : {} | computed_before : {} | total_after : {} | new_blocks : {} | block_kv_size : {}".format(
                 #     hit, tokens_this_step, computed_before, total_after, new_blocks, block_kv_size
                 # ))
@@ -209,11 +243,11 @@ class MemoryModel():
                 num_before = (computed + self.block_size - 1) // self.block_size if computed > 0 else 0
                 num_after = (computed + 1 + self.block_size - 1) // self.block_size
                 if num_after > num_before: # difference of the block is maximum one block
-                    block_kv_size += self.get_kv(self.block_size)
+                    block_kv_size += self.get_kv(self.block_size, model=model)
         return block_kv_size
     
     # get size of kv cache that should be evicted
-    def get_evict_kv(self, req):
+    def get_evict_kv(self, req, model=None):
         evict_size = 0
         # Use num_computed_tokens if available, fallback to input for backwards compat
         computed = req.num_computed_tokens
@@ -221,13 +255,13 @@ class MemoryModel():
         needed = max(0, computed - hit)
         # ceil division: (needed + block_size - 1) // block_size
         num_blocks = (needed + self.block_size - 1) // self.block_size
-        evict_size += self.get_kv(num_blocks * self.block_size)
+        evict_size += self.get_kv(num_blocks * self.block_size, model=model)
         return evict_size
 
-    def adjust_tokens(self, current_tokens, new_tokens, device=Device.NPU):
+    def adjust_tokens(self, current_tokens, new_tokens, device=Device.NPU, model=None):
         """Adjust a request's KV footprint from current_tokens to new_tokens."""
-        current_size = self.get_total_kv_tokens(current_tokens)
-        new_size = self.get_total_kv_tokens(new_tokens)
+        current_size = self.get_total_kv_tokens(current_tokens, model=model)
+        new_size = self.get_total_kv_tokens(new_tokens, model=model)
         if new_size > current_size:
             self.allocate(new_size - current_size, device)
         elif new_size < current_size:

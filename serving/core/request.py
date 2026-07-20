@@ -56,6 +56,7 @@ class Request:
         self.speculative_stage = None
         self.speculative_target_tokens = 0
         self.speculative_draft_tokens = 0
+        self.speculative_draft_generated = 0
         self.speculative_draft_kv_tokens = 0
         self.speculative_target_kv_tokens = 0
         self.speculative_verify_tokens = 0
