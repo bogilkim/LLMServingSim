@@ -1,0 +1,60 @@
+{
+  "num_nodes": 1,
+  "link_bw": 16,
+  "link_latency": 0,
+  "nodes": [
+    {
+      "num_instances": 2,
+      "cpu_mem": {
+        "mem_size": 512,
+        "mem_bw": 256,
+        "mem_latency": 0,
+        "pim_config": "DDR4_8GB_3200_pim"
+      },
+      "instances": [
+        {
+          "model_name": "meta-llama/Llama-3.1-8B",
+          "hardware": "GTX2080Ti",
+          "npu_mem": {
+            "mem_size": 11,
+            "mem_bw": 616,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "pd_type": null,
+          "speculative_decoding": true,
+          "speculative_method": "draft_model",
+          "speculative_role": "draft",
+          "speculative_draft_model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+          "speculative_draft_length": 4,
+          "speculative_acceptance_model": "constant",
+          "speculative_acceptance_rate": 0.8,
+          "enable_prefix_caching": false,
+          "enable_attn_offloading": true
+        },
+        {
+          "model_name": "meta-llama/Llama-3.1-8B",
+          "hardware": "GTX2080Ti",
+          "npu_mem": {
+            "mem_size": 11,
+            "mem_bw": 616,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "pd_type": null,
+          "speculative_decoding": true,
+          "speculative_method": "draft_model",
+          "speculative_role": "target",
+          "speculative_draft_model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+          "speculative_draft_length": 4,
+          "speculative_acceptance_model": "constant",
+          "speculative_acceptance_rate": 0.8,
+          "enable_prefix_caching": false,
+          "enable_attn_offloading": true
+        }
+      ]
+    }
+  ]
+}

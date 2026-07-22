@@ -4,20 +4,9 @@
   "link_latency": 0,
   "nodes": [
     {
-      "num_instances": 2,
+      "num_instances": 1,
       "cpu_mem": {"mem_size": 512, "mem_bw": 256, "mem_latency": 0},
       "instances": [
-        {
-          "model_name": "meta-llama/Llama-3.1-8B",
-          "hardware": "RTXPRO6000",
-          "npu_mem": {"mem_size": 96, "mem_bw": 1597, "mem_latency": 0},
-          "pd_type": null,
-          "tp_size": 1,
-          "speculative_decoding": true,
-          "speculative_role": "draft",
-          "speculative_draft_length": 4,
-          "enable_prefix_caching": false
-        },
         {
           "model_name": "Qwen/Qwen3-32B",
           "hardware": "RTXPRO6000",
@@ -25,8 +14,10 @@
           "pd_type": null,
           "tp_size": 1,
           "speculative_decoding": true,
-          "speculative_role": "target",
-          "speculative_draft_length": 4,
+          "speculative_method": "draft_model",
+          "speculative_role": "colocated",
+          "speculative_draft_model": "meta-llama/Llama-3.1-8B",
+          "speculative_draft_length": 10,
           "speculative_acceptance_model": "constant",
           "speculative_acceptance_rate": 0.8,
           "enable_prefix_caching": false
