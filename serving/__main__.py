@@ -945,6 +945,7 @@ def main():
             for inst_id in range(num_instances):
                 running_reqs = sum(len(batch.requests) for batch in schedulers[inst_id].inflight)
                 waiting_reqs = len([req for req in schedulers[inst_id].request if req.arrival <= current])
+                completed_reqs = len(schedulers[inst_id].done)
 
                 mem = schedulers[inst_id].memory
                 npu_used_mb = mem.npu_used / MB_TO_BYTE
@@ -953,6 +954,7 @@ def main():
                 line = (
                     f"{log_indent+tree_indent}Running Instance\\[{inst_id}]: "
                     f"{running_reqs} reqs, Waiting: {waiting_reqs} reqs, "
+                    f"Completed: {completed_reqs} reqs, "
                     f"Total # {schedulers[inst_id].num_npus} NPUs, "
                     f"Each NPU Memory Usage {npu_used_mb:.2f} MB "
                     f"({npu_util:.3f} % Used)"
