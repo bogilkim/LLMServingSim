@@ -25,6 +25,14 @@ python -m serving \
 
 Each participating instance sets `speculative_decoding: true` and has an explicit `speculative_role` of `draft` or `target`. For a two-instance configuration with `pd_type: null`, roles can also be inferred by order: draft first, target second. Explicit roles are recommended.
 
+In a separate draft/target topology, each instance's `model_name` is the
+model that executes on that instance. The draft instance must therefore name
+the actual lightweight draft model, not the served target model, and it needs
+its own profiler bundle under `profiler/perf/<hardware>/<draft-model>/`.
+When `speculative_draft_model` is also set, it declares the shared draft
+model and must match the draft instance's `model_name`; startup rejects a
+mismatch instead of silently charging target-model latency for every proposal.
+
 A single independent-draft instance is inferred as
 `speculative_role: colocated`. Set `speculative_draft_model` to the draft model
 identifier. The instance loads both weight sets and uses the target instance's

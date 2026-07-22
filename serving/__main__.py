@@ -281,11 +281,32 @@ def _resolve_speculative_roles(instances, runtime_configs):
                     "Colocated draft-model speculative decoding requires "
                     "speculative_draft_model."
                 )
-    elif classic and roles != {"draft", "target"}:
-        raise ValueError(
-            "Draft-model speculative decoding requires either colocated "
-            "instances or at least one draft and one target instance."
-        )
+    elif classic:
+        if roles != {"draft", "target"}:
+            raise ValueError(
+                "Draft-model speculative decoding requires either colocated "
+                "instances or at least one draft and one target instance."
+            )
+        declared_draft_models = {
+            runtime_configs[i].get("speculative_draft_model")
+            for i in classic
+            if runtime_configs[i].get("speculative_draft_model")
+        }
+        if len(declared_draft_models) > 1:
+            raise ValueError(
+                "Separate speculative instances declare different "
+                "speculative_draft_model values."
+            )
+        if declared_draft_models:
+            draft_model = next(iter(declared_draft_models))
+            for i in classic:
+                if (runtime_configs[i]["speculative_role"] == "draft"
+                        and instances[i]["model_name"] != draft_model):
+                    raise ValueError(
+                        "A separate draft instance executes its model_name; "
+                        f"instance {i} uses {instances[i]['model_name']!r}, "
+                        f"but speculative_draft_model is {draft_model!r}."
+                    )
 
 
 def _resolve_trace_paths(runtime_configs, launch_cwd):

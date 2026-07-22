@@ -126,6 +126,47 @@ class SpeculativeRoleInferenceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'speculative_draft_model'):
             namespace['_resolve_speculative_roles'](instances, configs)
 
+    def test_separate_draft_model_must_match_draft_instance_model(self):
+        source = Path('serving/__main__.py').read_text(encoding='utf-8')
+        module = ast.parse(source)
+        function = next(
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == '_resolve_speculative_roles'
+        )
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                '<roles>',
+                'exec',
+            ),
+            namespace,
+        )
+        instances = [
+            {'model_name': 'target-model', 'pd_type': None},
+            {'model_name': 'target-model', 'pd_type': None},
+        ]
+        configs = [
+            {
+                'speculative_decoding': True,
+                'speculative_role': 'draft',
+                'speculative_draft_model': 'draft-model',
+            },
+            {
+                'speculative_decoding': True,
+                'speculative_role': 'target',
+                'speculative_draft_model': 'draft-model',
+            },
+        ]
+
+        with self.assertRaisesRegex(
+                ValueError, 'draft instance executes its model_name'):
+            namespace['_resolve_speculative_roles'](instances, configs)
+
+        instances[0]['model_name'] = 'draft-model'
+        namespace['_resolve_speculative_roles'](instances, configs)
+
     def test_eagle3_role_is_colocated(self):
         source = Path('serving/__main__.py').read_text(encoding='utf-8')
         module = ast.parse(source)
