@@ -31,6 +31,10 @@ identifier. The instance loads both weight sets and uses the target instance's
 hardware and TP
 degree to resolve both profile bundles. Draft and target batches remain
 separate so each stage uses its own latency table and KV shape.
+When both models have ready work, the colocated scheduler alternates between
+them. This prevents an older draft-stage cohort from repeatedly winning FIFO
+selection while newer requests wait indefinitely for target prefill, which
+would otherwise keep speculative batches pathologically small.
 
 The target instance controls these settings:
 

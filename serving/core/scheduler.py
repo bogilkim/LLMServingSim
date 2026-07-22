@@ -100,6 +100,7 @@ class Scheduler:
         self.inflight = []
         self.done = []
         self.batch_ids = -1
+        self._last_colocated_model = None
 
         # memory model
         additional_models = (
@@ -123,6 +124,32 @@ class Scheduler:
                 and stage in ('draft_prefill', 'draft', 'draft_sync')):
             return self.speculative_draft_model
         return self.model
+
+    def _select_colocated_batch_model(self, requests):
+        """Choose fairly between ready draft and target work.
+
+        Requests remain ordered by arrival time, but an old request can spend
+        many iterations in the draft stage while newer requests wait for
+        target prefill. Selecting solely from the queue head would therefore
+        keep choosing the draft model and prevent the target-ready cohort from
+        growing. Alternate models whenever both have ready work while keeping
+        FIFO order within each model.
+        """
+        ready_models = []
+        for req in requests:
+            model = self._speculative_model_for_stage(
+                req.speculative_stage)
+            if model not in ready_models:
+                ready_models.append(model)
+
+        if not ready_models:
+            return self.model
+        if len(ready_models) == 1:
+            return ready_models[0]
+        for model in ready_models:
+            if model != self._last_colocated_model:
+                return model
+        return ready_models[0]
 
     def _adjust_speculative_tokens(self, current_tokens, new_tokens, model):
         if self.speculative_role == 'colocated':
@@ -384,6 +411,8 @@ class Scheduler:
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
             self.inflight.append(batch)
+            if self.speculative_role == 'colocated':
+                self._last_colocated_model = self.model
             self.logger.info(
                 "Scheduling speculative verify batch #%d to NPU[%d]",
                 batch.batch_id,
@@ -431,8 +460,7 @@ class Scheduler:
             batch_req = [req for req in self.request if req.arrival <= current]
             batch_model = self.model
             if self.speculative_role == 'colocated' and batch_req:
-                batch_model = self._speculative_model_for_stage(
-                    batch_req[0].speculative_stage)
+                batch_model = self._select_colocated_batch_model(batch_req)
                 batch_req = [
                     req for req in batch_req
                     if self._speculative_model_for_stage(
@@ -682,6 +710,8 @@ class Scheduler:
                 batch.speculative_stage = 'draft'
             elif self.speculative_role == 'colocated':
                 batch.speculative_stage = 'target_prefill'
+            if self.speculative_role == 'colocated':
+                self._last_colocated_model = batch_model
             return batch
         
         # Schedule already batched request

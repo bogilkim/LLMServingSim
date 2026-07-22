@@ -77,6 +77,7 @@ def _scheduler(role):
     scheduler.speculative_draft_model = 'org/eagle3-head'
     scheduler.inflight = []
     scheduler.batch_ids = -1
+    scheduler._last_colocated_model = None
     scheduler.num_npus = 1
     scheduler.pd_type = None
     scheduler.enable_prefix_caching = False
@@ -145,6 +146,35 @@ class SpeculativeSchedulerTest(unittest.TestCase):
             set(scheduler.memory.block_models),
             {'org/eagle3-head'},
         )
+
+    def test_colocated_target_prefill_does_not_starve_behind_older_draft(self):
+        scheduler = _scheduler('colocated')
+        scheduler.max_num_batched_tokens = 2048
+        scheduler.max_num_seqs = 128
+        draft = Request(0, 'target', 10, 20, 0, 0)
+        draft.speculative_active = True
+        draft.speculative_stage = 'draft'
+        draft.speculative_target_tokens = 10
+        draft.speculative_draft_kv_tokens = 10
+        draft.num_computed_tokens = 10
+
+        targets = [
+            Request(i, 'target', 10, 20, 0, 0)
+            for i in range(1, 65)
+        ]
+        for target in targets:
+            target.speculative_active = True
+            target.speculative_stage = 'target_prefill'
+        scheduler.request = [draft] + targets
+        scheduler._last_colocated_model = 'org/eagle3-head'
+
+        batch = scheduler.schedule_base(0, 0)
+
+        self.assertEqual(batch.model, 'target')
+        self.assertEqual(batch.speculative_stage, 'target_prefill')
+        self.assertEqual(batch.requests, targets)
+        self.assertEqual(scheduler.request, [draft])
+        self.assertEqual(scheduler._last_colocated_model, 'target')
 
     def test_colocated_transfer_rolls_back_draft_kv_with_draft_shape(self):
         scheduler = _scheduler('colocated')
