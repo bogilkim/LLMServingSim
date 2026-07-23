@@ -245,16 +245,20 @@ def _sim_latencies(rows: list[dict]) -> tuple[list[float], list[float], list[flo
 # Sim log lines look like::
 #
 #   [12.0s] Avg prompt throughput: 1234.0 tokens/s, Avg generation throughput: 5678.0 tokens/s
-#           ├─Running Instance[0]: 32 reqs, Waiting: 0 reqs, Total # 1 NPUs, ...
-#           ├─Running Instance[1]: 30 reqs, Waiting: 1 reqs, Total # 1 NPUs, ...
+#           ├─Instance[0]: Active: 32 reqs (Executing now: 30, Between steps: 2),
+#             Queued: 1 reqs (not started), Completed: 4 reqs, ...
 #
-# We accumulate running/waiting across instances at each tick and emit one
-# row per timestamp.
+# We map lifecycle-oriented Active/Queued counts back to the running/waiting
+# column names used by the existing validation CSV and plots. The legacy
+# expression remains supported so older simulator logs can still be parsed.
 _TS_RE = re.compile(r"^\[(\d+\.?\d*)s\]")
 _TPUT_RE = re.compile(
     r"Avg prompt throughput:\s*(\d+\.?\d*).*generation throughput:\s*(\d+\.?\d*)"
 )
 _INST_RE = re.compile(
+    r"Instance\[(\d+)\]:\s*Active:\s*(\d+) reqs.*Queued:\s*(\d+) reqs"
+)
+_LEGACY_INST_RE = re.compile(
     r"Running Instance\[(\d+)\]:\s*(\d+) reqs, Waiting:\s*(\d+) reqs"
 )
 
@@ -284,7 +288,7 @@ def _load_sim_log(path: Path) -> list[dict]:
                     cur["prompt_throughput"] = float(m_t.group(1))
                     cur["gen_throughput"] = float(m_t.group(2))
                 continue
-            m_i = _INST_RE.search(line)
+            m_i = _INST_RE.search(line) or _LEGACY_INST_RE.search(line)
             if m_i and cur is not None:
                 cur["running"] += int(m_i.group(2))
                 cur["waiting"] += int(m_i.group(3))

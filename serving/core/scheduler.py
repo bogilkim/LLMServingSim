@@ -1790,6 +1790,31 @@ class Scheduler:
     # get first request's arrival time
     def get_first_arrival_time(self):
         return self.first_arrival_time if self.first_arrival_time != 0 else 1 # need to add event handler at first
+
+    def request_status_counts(self, current):
+        """Return lifecycle-oriented request counts for the status dashboard.
+
+        Requests that have already run at least once are still active while
+        they sit in ``self.request`` between iterations. Treating that pool as
+        a single waiting state makes active decode requests appear to bounce
+        between running and waiting on every scheduler step.
+        """
+        executing = sum(len(batch.requests) for batch in self.inflight)
+        ready = [req for req in self.request if req.arrival <= current]
+        queued = sum(
+            req.queuing_delay < 0 and req.is_init for req in ready
+        )
+        between_steps = len(ready) - queued
+        awaiting_arrival = len(self.request) - len(ready)
+
+        return {
+            "queued": queued,
+            "active": executing + between_steps,
+            "executing": executing,
+            "between_steps": between_steps,
+            "awaiting_arrival": awaiting_arrival,
+            "completed": len(self.done),
+        }
     
     # merge requests in the request pool, ensuring they are sorted by arrival time
     def _merge_by_arrival_id(self, left, right):

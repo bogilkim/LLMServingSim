@@ -368,6 +368,24 @@ class Router:
         """Check if there are unrouted requests remaining."""
         return self._pending_idx < len(self._pending_requests)
 
+    def request_status_counts(self, current_time_ns):
+        """Return counts for requests that have not reached a scheduler yet."""
+        pending = self._pending_requests[self._pending_idx:]
+        awaiting_arrival = sum(
+            req['arrival_time_ns'] > current_time_ns for req in pending
+        )
+        awaiting_routing = len(pending) - awaiting_arrival
+        dependency_blocked = sum(
+            len(session['sub_requests']) - session['next_index']
+            for session in self._deferred_sessions.values()
+        )
+        return {
+            "awaiting_arrival": awaiting_arrival,
+            "awaiting_routing": awaiting_routing,
+            "dependency_blocked": dependency_blocked,
+            "total": self._next_request_id,
+        }
+
     def get_first_arrival_time(self):
         """Return the first request's arrival time in ns, or 1 if no requests."""
         if self._pending_requests:

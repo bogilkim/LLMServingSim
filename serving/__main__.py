@@ -963,19 +963,61 @@ def main():
 
             ######### Per Instance Metrics #########
 
+            instance_statuses = [
+                scheduler.request_status_counts(current)
+                for scheduler in schedulers
+            ]
+            router_status = router.request_status_counts(current)
+            queued_reqs = sum(status["queued"] for status in instance_statuses)
+            active_reqs = sum(status["active"] for status in instance_statuses)
+            completed_reqs = sum(status["completed"] for status in instance_statuses)
+            awaiting_arrival_reqs = (
+                router_status["awaiting_arrival"]
+                + sum(status["awaiting_arrival"] for status in instance_statuses)
+            )
+            awaiting_routing_reqs = router_status["awaiting_routing"]
+            dependency_blocked_reqs = router_status["dependency_blocked"]
+            accounted_reqs = (
+                awaiting_arrival_reqs + awaiting_routing_reqs
+                + dependency_blocked_reqs + queued_reqs + active_reqs
+                + completed_reqs
+            )
+            total_reqs = router_status["total"] or accounted_reqs
+
+            lifecycle_line = (
+                f"{log_indent+tree_indent}Requests: "
+                f"[dim]Awaiting arrival/tool: {awaiting_arrival_reqs}[/], "
+            )
+            if awaiting_routing_reqs:
+                lifecycle_line += (
+                    f"[dim]Awaiting routing: {awaiting_routing_reqs}[/], "
+                )
+            if dependency_blocked_reqs:
+                lifecycle_line += (
+                    f"[magenta]Dependency blocked: {dependency_blocked_reqs}[/], "
+                )
+            lifecycle_line += (
+                f"[yellow]Queued (not started): {queued_reqs}[/], "
+                f"[green]Active: {active_reqs}[/], "
+                f"[cyan]Completed: {completed_reqs}[/], "
+                f"Total: {total_reqs}"
+            )
+            print_markup(lifecycle_line)
+
             for inst_id in range(num_instances):
-                running_reqs = sum(len(batch.requests) for batch in schedulers[inst_id].inflight)
-                waiting_reqs = len([req for req in schedulers[inst_id].request if req.arrival <= current])
-                completed_reqs = len(schedulers[inst_id].done)
+                status = instance_statuses[inst_id]
 
                 mem = schedulers[inst_id].memory
                 npu_used_mb = mem.npu_used / MB_TO_BYTE
                 npu_util = (mem.npu_used / mem.npu_mem * 100.0) if mem.npu_mem else 0.0
 
                 line = (
-                    f"{log_indent+tree_indent}Running Instance\\[{inst_id}]: "
-                    f"{running_reqs} reqs, Waiting: {waiting_reqs} reqs, "
-                    f"Completed: {completed_reqs} reqs, "
+                    f"{log_indent+tree_indent}Instance\\[{inst_id}]: "
+                    f"[green]Active: {status['active']} reqs "
+                    f"(Executing now: {status['executing']}, "
+                    f"Between steps: {status['between_steps']})[/], "
+                    f"[yellow]Queued: {status['queued']} reqs (not started)[/], "
+                    f"[cyan]Completed: {status['completed']} reqs[/], "
                     f"Total # {schedulers[inst_id].num_npus} NPUs, "
                     f"Each NPU Memory Usage {npu_used_mb:.2f} MB "
                     f"({npu_util:.3f} % Used)"

@@ -114,10 +114,41 @@ Independently of the level, the simulator always emits:
 The throughput log line itself is identical regardless of level,
 the only difference is what surrounds it.
 
-## Throughput log line
+## Throughput and request lifecycle dashboard
 
-Every `--log-interval` seconds the simulator prints a one-line
-status update. The format adapts to which features are enabled:
+Every `--log-interval` seconds the simulator prints throughput followed by
+global and per-instance request lifecycle counts:
+
+```text
+[2.0s] Avg prompt throughput: 1536.0 tokens/s, Avg generation throughput: 420.0 tokens/s
+       ├─Requests: Awaiting arrival/tool: 68, Queued (not started): 0, Active: 23, Completed: 9, Total: 100
+       ├─Instance[0]: Active: 23 reqs (Executing now: 1, Between steps: 22), Queued: 0 reqs (not started), Completed: 9 reqs, ...
+```
+
+The top-level counts are lifecycle states. In particular, an active request
+remains `Active` between scheduler iterations instead of repeatedly changing
+between running and waiting:
+
+| Field | Meaning |
+| --- | --- |
+| `Awaiting arrival/tool` | Loaded requests whose arrival time has not been reached. This includes a released agentic sub-request during its tool-duration delay. |
+| `Dependency blocked` | Later agentic sub-requests that cannot be released until an earlier sub-request completes. Printed only when nonzero. |
+| `Queued (not started)` | Requests routed to a scheduler but never included in a batch yet. |
+| `Active` | Requests that have executed at least once and have not completed. |
+| `Completed` | Requests whose final output token has completed. |
+| `Total` | Total logical requests loaded, counting each agentic sub-request separately. |
+
+Each instance splits `Active` into two snapshot locations:
+
+- `Executing now`: currently present in an ASTRA-Sim batch.
+- `Between steps`: already-started requests in the scheduler pool awaiting
+  their next prefill chunk or decode iteration. This is not queueing delay.
+
+`Active + Queued + Completed` on one instance does not include requests that
+have not arrived or have not been routed; those appear only in the global
+`Requests` line.
+
+The remaining memory and feature-specific fields adapt to the enabled mode:
 
 ### Single-instance baseline
 
