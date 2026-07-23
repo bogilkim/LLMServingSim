@@ -12,7 +12,8 @@
       },
       "instances": [
         {
-          "model_name": "meta-llama/Llama-3.1-8B",
+          "model_name": "EAGLE/EAGLE3-LLaMA3.1-Instruct-8B",
+          "dtype": "float16",
           "hardware": "GTX2080Ti",
           "npu_mem": {
             "mem_size": 11,
@@ -25,7 +26,7 @@
           "speculative_decoding": true,
           "speculative_method": "draft_model",
           "speculative_role": "draft",
-          "speculative_draft_model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+          "speculative_draft_model": "EAGLE/EAGLE3-LLaMA3.1-Instruct-8B",
           "speculative_draft_length": 4,
           "speculative_acceptance_model": "constant",
           "speculative_acceptance_rate": 0.8,
@@ -34,6 +35,7 @@
         {
           "model_name": "meta-llama/Llama-3.1-8B",
           "hardware": "GTX2080Ti",
+          "dtype": "bfloat16",
           "npu_mem": {
             "mem_size": 11,
             "mem_bw": 616,
@@ -45,7 +47,7 @@
           "speculative_decoding": true,
           "speculative_method": "draft_model",
           "speculative_role": "target",
-          "speculative_draft_model": "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+          "speculative_draft_model": "EAGLE/EAGLE3-LLaMA3.1-Instruct-8B",
           "speculative_draft_length": 4,
           "speculative_acceptance_model": "constant",
           "speculative_acceptance_rate": 0.8,

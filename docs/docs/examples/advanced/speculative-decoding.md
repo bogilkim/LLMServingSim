@@ -89,6 +89,13 @@ pipeline is profiled as one aggregate GPU operation. The simulator uses the
 normal target profile for prompt prefill and `tp1/eagle3.csv` for each
 speculative iteration.
 
+Do not configure an EAGLE3 head as an independent `draft_model`. An EAGLE3
+head is not a standalone autoregressive LM, and that mode would repeatedly
+charge embedding and LM-head work while keeping draft and verification in
+separate simulator iterations. Model configs marked with
+`speculative_model_type: eagle3` are rejected in the independent path with an
+error that points to the native aggregate profiler.
+
 Inside the vLLM container, first create the normal target profile and then
 supplement it with the EAGLE3 table:
 
@@ -117,6 +124,27 @@ python -m serving \
   --dataset workloads/example_trace.jsonl \
   --num-reqs 1
 ```
+
+For a single H100, first generate the matching target and aggregate
+profiles:
+
+```bash
+python -m profiler profile meta-llama/Llama-3.1-8B \
+  --hardware H100 \
+  --tp 1 \
+  --dtype bfloat16
+
+python -m profiler eagle3 meta-llama/Llama-3.1-8B \
+  --hardware H100 \
+  --tp 1 \
+  --dtype bfloat16 \
+  --eagle-model EAGLE/EAGLE3-LLaMA3.1-Instruct-8B \
+  --num-speculative-tokens 4
+```
+
+Then use `configs/cluster/single_node_eagle3_h100_instance.json`. This
+configuration keeps `tp_size=1` and `pp_size=1`: increasing PP would require
+additional GPUs and would not accelerate a one-H100 experiment.
 
 The instance sets:
 

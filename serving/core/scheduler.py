@@ -15,6 +15,25 @@ from .pim_model import *
 from .speculative import SpeculativeAcceptanceModel
 import numpy as np
 
+
+def _validate_speculative_draft_model(method, draft_model, draft_config):
+    """Reject native speculative heads in the independent-LM path.
+
+    EAGLE3 is not a standalone autoregressive draft LM. Charging its model
+    config through the regular draft-model trace repeats embedding/lm-head
+    work that native vLLM performs inside one fused speculative iteration.
+    The aggregate ``eagle3.csv`` path is both more faithful and substantially
+    cheaper for a colocated single-GPU deployment.
+    """
+    if (method == 'draft_model'
+            and draft_config.get('speculative_model_type') == 'eagle3'):
+        raise ValueError(
+            f"{draft_model!r} is a native EAGLE3 head and cannot be used "
+            "with speculative_method='draft_model'. Configure one colocated "
+            "target instance with speculative_method='eagle3' and generate "
+            "the target bundle's eagle3.csv with `python -m profiler eagle3`."
+        )
+
 # class that shedules request of astra-sim
 class Scheduler:
     def __init__(self, model, node_id, instance_id, max_num_seqs, max_num_batched_tokens,
@@ -74,9 +93,18 @@ class Scheduler:
                 "speculative_draft_model."
             )
         self.speculative_draft_config = None
+        draft_config_name = self.speculative_draft_model
+        if self.speculative_role == 'draft' and not draft_config_name:
+            draft_config_name = self.model
+        if (self.speculative_method == 'draft_model' and draft_config_name
+                and self.speculative_role in ('draft', 'colocated')):
+            draft_config = get_config(draft_config_name)
+            _validate_speculative_draft_model(
+                self.speculative_method, draft_config_name, draft_config)
+            if self.speculative_role == 'colocated':
+                self.speculative_draft_config = draft_config
+
         if self.speculative_role == 'colocated':
-            self.speculative_draft_config = get_config(
-                self.speculative_draft_model)
             self.max_num_batched_tokens = min(
                 self.max_num_batched_tokens,
                 self.speculative_draft_config['max_position_embeddings'],

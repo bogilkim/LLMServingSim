@@ -25,7 +25,10 @@ def _stub_optional_dependencies():
 _stub_optional_dependencies()
 
 from serving.core.request import Request
-from serving.core.scheduler import Scheduler
+from serving.core.scheduler import (
+    Scheduler,
+    _validate_speculative_draft_model,
+)
 from serving.core.memory_model import MemoryModel
 from serving.core.speculative import SpeculativeAcceptanceModel
 
@@ -103,6 +106,20 @@ def _batch(request, stage=None, scheduled_tokens=None):
 
 
 class SpeculativeSchedulerTest(unittest.TestCase):
+    def test_native_eagle3_head_rejects_independent_draft_path(self):
+        with self.assertRaisesRegex(ValueError, "speculative_method='eagle3'"):
+            _validate_speculative_draft_model(
+                'draft_model',
+                'EAGLE/EAGLE3-LLaMA3.1-Instruct-8B',
+                {'speculative_model_type': 'eagle3'},
+            )
+
+        _validate_speculative_draft_model(
+            'eagle3',
+            'EAGLE/EAGLE3-LLaMA3.1-Instruct-8B',
+            {'speculative_model_type': 'eagle3'},
+        )
+
     def test_colocated_memory_accounts_for_both_models(self):
         target = 'Qwen/Qwen3-32B'
         draft = 'meta-llama/Llama-3.1-8B'

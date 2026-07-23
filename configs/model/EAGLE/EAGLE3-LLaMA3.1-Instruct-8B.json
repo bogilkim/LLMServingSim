@@ -2,6 +2,7 @@
   "architectures": [
     "LlamaForCausalLM"
   ],
+  "speculative_model_type": "eagle3",
   "bos_token_id": 128000,
   "eos_token_id": 128001,
   "hidden_act": "silu",
