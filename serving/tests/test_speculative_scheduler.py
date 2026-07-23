@@ -36,6 +36,7 @@ class _Memory:
         self.adjustment_models = []
         self.block_models = []
         self.allocations = []
+        self.frees = []
 
     def adjust_tokens(
             self, current_tokens, new_tokens, device, model=None):
@@ -55,6 +56,9 @@ class _Memory:
 
     def allocate(self, size, device):
         self.allocations.append(size)
+
+    def free(self, size, device):
+        self.frees.append(size)
 
     def get_total_kv_tokens(self, tokens, model=None):
         multiplier = 2 if model == 'org/eagle3-head' else 10
@@ -175,6 +179,34 @@ class SpeculativeSchedulerTest(unittest.TestCase):
             scheduler.memory.adjustment_models,
             ['target', 'org/eagle3-head'],
         )
+
+    def test_colocated_fused_completion_clears_released_draft_kv(self):
+        scheduler = _scheduler('colocated')
+        request = Request(0, 'target', 10, 14, 0, 0)
+        request.speculative_active = True
+        request.speculative_stage = 'draft_sync'
+        request.speculative_target_tokens = 11
+        request.speculative_target_kv_tokens = 10
+        request.speculative_draft_kv_tokens = 10
+        request.speculative_draft_tokens = 4
+        request.speculative_draft_generated = 0
+        request.num_computed_tokens = 10
+
+        batch = _batch(request, 'draft_verify', {request.id: 5})
+        batch.speculative_target_kv_after = {request.id: 15}
+        batch.speculative_draft_kv_after = {request.id: 14}
+        scheduler.inflight = [batch]
+
+        _, _, final, _ = scheduler.add_done(1, 0, 100)
+
+        self.assertEqual(final, [request])
+        self.assertEqual(request.speculative_target_kv_tokens, 0)
+        self.assertEqual(request.speculative_draft_kv_tokens, 0)
+        self.assertEqual(len(scheduler.memory.adjustments), 2)
+
+        scheduler.release_speculative_draft(request)
+
+        self.assertEqual(len(scheduler.memory.adjustments), 2)
 
     def test_colocated_memory_accounts_for_both_models(self):
         target = 'Qwen/Qwen3-32B'

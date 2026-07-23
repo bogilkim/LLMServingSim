@@ -1392,6 +1392,7 @@ class Scheduler:
                     draft_kv_size = self.memory.get_evict_kv(
                         req, model=self.speculative_draft_model)
                     self.memory.free(target_kv_size + draft_kv_size, Device.NPU)
+                    req.speculative_draft_kv_tokens = 0
                     req.add_latency(finish)
                     req.speculative_stage = None
                     req.speculative_target_kv_tokens = 0
