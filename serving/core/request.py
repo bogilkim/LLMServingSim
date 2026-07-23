@@ -52,7 +52,8 @@ class Request:
 
         # Speculative decoding state
         self.speculative_active = False
-        # draft_prefill -> target_prefill -> draft -> verify -> draft_sync
+        # draft_prefill -> target_prefill -> draft_verify (colocated)
+        # Independent draft/target instances retain draft/draft_sync/verify.
         self.speculative_stage = None
         self.speculative_target_tokens = 0
         self.speculative_draft_tokens = 0

@@ -15,25 +15,6 @@ from .pim_model import *
 from .speculative import SpeculativeAcceptanceModel
 import numpy as np
 
-
-def _validate_speculative_draft_model(method, draft_model, draft_config):
-    """Reject native speculative heads in the independent-LM path.
-
-    EAGLE3 is not a standalone autoregressive draft LM. Charging its model
-    config through the regular draft-model trace repeats embedding/lm-head
-    work that native vLLM performs inside one fused speculative iteration.
-    The aggregate ``eagle3.csv`` path is both more faithful and substantially
-    cheaper for a colocated single-GPU deployment.
-    """
-    if (method == 'draft_model'
-            and draft_config.get('speculative_model_type') == 'eagle3'):
-        raise ValueError(
-            f"{draft_model!r} is a native EAGLE3 head and cannot be used "
-            "with speculative_method='draft_model'. Configure one colocated "
-            "target instance with speculative_method='eagle3' and generate "
-            "the target bundle's eagle3.csv with `python -m profiler eagle3`."
-        )
-
 # class that shedules request of astra-sim
 class Scheduler:
     def __init__(self, model, node_id, instance_id, max_num_seqs, max_num_batched_tokens,
@@ -93,18 +74,9 @@ class Scheduler:
                 "speculative_draft_model."
             )
         self.speculative_draft_config = None
-        draft_config_name = self.speculative_draft_model
-        if self.speculative_role == 'draft' and not draft_config_name:
-            draft_config_name = self.model
-        if (self.speculative_method == 'draft_model' and draft_config_name
-                and self.speculative_role in ('draft', 'colocated')):
-            draft_config = get_config(draft_config_name)
-            _validate_speculative_draft_model(
-                self.speculative_method, draft_config_name, draft_config)
-            if self.speculative_role == 'colocated':
-                self.speculative_draft_config = draft_config
-
         if self.speculative_role == 'colocated':
+            self.speculative_draft_config = get_config(
+                self.speculative_draft_model)
             self.max_num_batched_tokens = min(
                 self.max_num_batched_tokens,
                 self.speculative_draft_config['max_position_embeddings'],
@@ -129,6 +101,7 @@ class Scheduler:
         self.done = []
         self.batch_ids = -1
         self._last_colocated_model = None
+        self._last_colocated_fused = False
 
         # memory model
         additional_models = (
@@ -186,6 +159,133 @@ class Scheduler:
         else:
             self.memory.adjust_tokens(
                 current_tokens, new_tokens, Device.NPU)
+
+    def _fused_speculative_candidates(self, current):
+        if (self.speculative_role != 'colocated' or self.pp_size != 1
+                or getattr(self, 'speculative_method', 'draft_model') != 'draft_model'):
+            return []
+        return [
+            req for req in self.request
+            if req.arrival <= current
+            and req.speculative_stage in ('draft_sync', 'draft')
+            and req.speculative_draft_generated < req.speculative_draft_tokens
+        ]
+
+    def _fused_speculative_kv_growth(self, requests, draft_steps,
+                                     verify_tokens):
+        draft_before = {}
+        draft_after = {}
+        target_before = {}
+        target_after = {}
+        total_growth = 0
+        for req in requests:
+            req_draft_before = int(req.speculative_draft_kv_tokens)
+            req_draft_after = req_draft_before + draft_steps
+            req_target_before = int(req.speculative_target_kv_tokens)
+            req_target_after = req_target_before + verify_tokens
+
+            draft_before[req.id] = req_draft_before
+            draft_after[req.id] = req_draft_after
+            target_before[req.id] = req_target_before
+            target_after[req.id] = req_target_after
+
+            total_growth += max(
+                0,
+                self.memory.get_total_kv_tokens(
+                    req_draft_after, model=self.speculative_draft_model)
+                - self.memory.get_total_kv_tokens(
+                    req_draft_before, model=self.speculative_draft_model),
+            )
+            total_growth += max(
+                0,
+                self.memory.get_total_kv_tokens(
+                    req_target_after, model=self.model)
+                - self.memory.get_total_kv_tokens(
+                    req_target_before, model=self.model),
+            )
+        return (
+            total_growth, draft_before, draft_after,
+            target_before, target_after,
+        )
+
+    def _schedule_fused_speculative_round(self, current, sys, candidates):
+        if sys != self.start_npu or not candidates:
+            return None
+        if len(self.inflight) >= self.pp_size:
+            return None
+
+        first = candidates[0]
+        proposal_len = max(1, int(first.speculative_draft_tokens))
+        generated = max(0, int(first.speculative_draft_generated))
+        draft_steps = proposal_len - generated
+        if draft_steps <= 0:
+            return None
+
+        candidates = [
+            req for req in candidates
+            if int(req.speculative_draft_tokens) == proposal_len
+            and int(req.speculative_draft_generated) == generated
+        ]
+        running_reqs = sum(len(batch.requests) for batch in self.inflight)
+        available_slots = max(0, int(self.max_num_seqs) - running_reqs)
+        verify_tokens = proposal_len + 1
+        max_batch = int(self.max_num_batched_tokens) // verify_tokens
+        if max_batch <= 0:
+            return None
+        batch_req = candidates[:min(available_slots, max_batch)]
+        if not batch_req:
+            return None
+
+        while batch_req:
+            growth = self._fused_speculative_kv_growth(
+                batch_req, draft_steps, verify_tokens)
+            if self.memory.is_avail(growth[0], Device.NPU):
+                break
+            batch_req.pop()
+        if not batch_req:
+            raise RuntimeError(
+                "Fused speculative round cannot make progress because "
+                "draft/target KV memory is exhausted."
+            )
+
+        (kv_size, draft_before, draft_after,
+         target_before, target_after) = growth
+        for req in batch_req:
+            self.request.remove(req)
+        if kv_size > 0:
+            self.memory.allocate(kv_size, Device.NPU)
+
+        scheduled_tokens = {
+            req.id: verify_tokens for req in batch_req
+        }
+        target_kv_lens = [target_before[req.id] for req in batch_req]
+        total_len = len(batch_req) * verify_tokens
+        batch = Batch(
+            self.get_batch_id(), self.model, total_len, 0,
+            [verify_tokens] * len(batch_req), [], len(batch_req), 0,
+            [verify_tokens] * len(batch_req), target_kv_lens, [], current,
+            kv_size, 0, 0,
+        )
+        batch.speculative_stage = 'draft_verify'
+        batch.speculative_draft_model = self.speculative_draft_model
+        batch.speculative_draft_steps = draft_steps
+        batch.speculative_proposal_len = proposal_len
+        batch.speculative_draft_kv_before = draft_before
+        batch.speculative_draft_kv_after = draft_after
+        batch.speculative_target_kv_before = target_before
+        batch.speculative_target_kv_after = target_after
+        batch.scheduled_tokens = scheduled_tokens
+        batch.fired.append(sys)
+        batch.requests.extend(batch_req)
+        self.inflight.append(batch)
+        self._last_colocated_model = self.speculative_draft_model
+        self._last_colocated_fused = True
+        self.logger.info(
+            "Scheduling fused speculative draft(%d)+verify batch #%d "
+            "with %d requests to NPU[%d]",
+            draft_steps, batch.batch_id, len(batch_req), sys,
+        )
+        return batch
 
     @staticmethod
     def _commit_speculative_first_token(req, finish):
@@ -474,6 +574,25 @@ class Scheduler:
 
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
+        exclude_fused_candidates = False
+        if (sys == self.start_npu and self.speculative_role == 'colocated'
+                and self.pp_size == 1
+                and getattr(self, 'speculative_method', 'draft_model') == 'draft_model'):
+            fused_candidates = self._fused_speculative_candidates(current)
+            other_ready = any(
+                req.arrival <= current
+                and req.speculative_stage not in ('draft_sync', 'draft')
+                for req in self.request
+            )
+            if fused_candidates and not (
+                    self._last_colocated_fused and other_ready):
+                batch = self._schedule_fused_speculative_round(
+                    current, sys, fused_candidates)
+                if batch is not None:
+                    return batch
+                return None
+            exclude_fused_candidates = bool(fused_candidates)
+
         # first NPU to process new batch
         if sys == self.start_npu:
             # nothing to batch return None
@@ -486,6 +605,11 @@ class Scheduler:
 
             # scheduling start
             batch_req = [req for req in self.request if req.arrival <= current]
+            if exclude_fused_candidates:
+                batch_req = [
+                    req for req in batch_req
+                    if req.speculative_stage not in ('draft_sync', 'draft')
+                ]
             batch_model = self.model
             if self.speculative_role == 'colocated' and batch_req:
                 batch_model = self._select_colocated_batch_model(batch_req)
@@ -740,6 +864,7 @@ class Scheduler:
                 batch.speculative_stage = 'target_prefill'
             if self.speculative_role == 'colocated':
                 self._last_colocated_model = batch_model
+                self._last_colocated_fused = False
             return batch
         
         # Schedule already batched request
@@ -1214,6 +1339,79 @@ class Scheduler:
                     req.speculative_verify_tokens = (
                         req.speculative_draft_tokens + 1)
                     req.speculative_stage = 'eagle3'
+                    pool.append(req)
+                continue
+
+            # Colocated draft-model round: all remaining draft forwards and
+            # target verification completed in one ASTRA-Sim trace.
+            if (self.speculative_decoding and self.speculative_role == 'colocated'
+                    and batch_stage == 'draft_verify'
+                    and req.speculative_stage in ('draft_sync', 'draft')):
+                base_tokens = int(req.speculative_target_tokens)
+                verify_tokens = int(batch.scheduled_tokens[req.id])
+                accepted = self.speculative_acceptance_model.sample(
+                    request=req,
+                    iteration=req.speculative_iteration,
+                    draft_tokens=req.speculative_draft_tokens,
+                )
+                accepted = min(
+                    max(0, accepted),
+                    max(0, req.output - base_tokens - 1),
+                )
+                committed = base_tokens + accepted + 1
+                retained_kv_tokens = committed - 1
+                req.speculative_accept_tokens = accepted
+
+                self._adjust_speculative_tokens(
+                    batch.speculative_target_kv_after[req.id],
+                    retained_kv_tokens,
+                    self.model,
+                )
+                self._adjust_speculative_tokens(
+                    batch.speculative_draft_kv_after[req.id],
+                    retained_kv_tokens,
+                    self.speculative_draft_model,
+                )
+
+                req.num_computed_tokens = retained_kv_tokens
+                req.speculative_target_tokens = committed
+                req.speculative_target_kv_tokens = retained_kv_tokens
+                req.speculative_draft_kv_tokens = retained_kv_tokens
+                req.speculative_draft_generated = 0
+                gen_t += self._commit_speculative_first_token(req, finish)
+                gen_t += accepted + 1
+                req.add_itl(finish)
+                if accepted:
+                    req.itl.extend([0] * accepted)
+
+                req.speculative_iteration += 1
+                if committed >= req.output:
+                    self.logger.info("Request #%d is done", req.id)
+                    target_kv_size = self.memory.get_evict_kv(
+                        req, model=self.model)
+                    draft_kv_size = self.memory.get_evict_kv(
+                        req, model=self.speculative_draft_model)
+                    self.memory.free(target_kv_size + draft_kv_size, Device.NPU)
+                    req.add_latency(finish)
+                    req.speculative_stage = None
+                    req.speculative_target_kv_tokens = 0
+                    self.done.append(req)
+                    final_reqs.append(req)
+                else:
+                    remaining = req.output - committed
+                    verify_cap = max(
+                        0, int(self.max_num_batched_tokens) - 1)
+                    req.speculative_draft_tokens = min(
+                        self.speculative_draft_length,
+                        verify_cap,
+                        max(0, remaining - 1),
+                    )
+                    req.speculative_verify_tokens = (
+                        req.speculative_draft_tokens + 1)
+                    if req.speculative_draft_tokens == 0:
+                        req.speculative_stage = 'verify'
+                    else:
+                        req.speculative_stage = 'draft_sync'
                     pool.append(req)
                 continue
 

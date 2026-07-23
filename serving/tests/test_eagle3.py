@@ -194,5 +194,121 @@ class Eagle3TraceTest(unittest.TestCase):
             os.unlink(output_path)
 
 
+class FusedDraftVerifyTraceTest(unittest.TestCase):
+    def test_appends_draft_steps_before_target_verify(self):
+        request0 = types.SimpleNamespace(id=0)
+        request1 = types.SimpleNamespace(id=1)
+        batch = trace_generator.Batch(
+            3, "org/target", 10, 20, [5, 5], [10, 10], 2, 0,
+            [5, 5], [10, 10], [], 0, 0,
+        )
+        batch.requests.extend([request0, request1])
+        batch.speculative_draft_model = "org/draft"
+        batch.speculative_draft_steps = 2
+        batch.speculative_draft_kv_before = {0: 10, 1: 20}
+
+        emitted = []
+
+        def build_ctx(hardware, model, *args, **kwargs):
+            return types.SimpleNamespace(model=model)
+
+        def build_batch_ctx(sub_batch, ctx):
+            return types.SimpleNamespace(batch=sub_batch)
+
+        def emit_body(ctx, bctx, sub_batch, config, block_mode_on, output):
+            emitted.append((ctx.model, list(sub_batch.decode_k_list)))
+            output.write(trace_generator.formatter(
+                ctx.model.replace("/", "_"), "1", "LOCAL", "0",
+                "LOCAL", "0", "LOCAL", "0", "NONE", "0", "NONE",
+            ))
+
+        with tempfile.NamedTemporaryFile(delete=False) as output:
+            output_path = output.name
+        try:
+            with (
+                mock.patch.object(
+                    trace_generator, "_build_trace_ctx",
+                    side_effect=build_ctx,
+                ),
+                mock.patch.object(
+                    trace_generator, "_build_batch_ctx",
+                    side_effect=build_batch_ctx,
+                ),
+                mock.patch.object(
+                    trace_generator, "_emit_standard_trace_body",
+                    side_effect=emit_body,
+                ),
+            ):
+                trace_generator._synthesize_fused_draft_verify_trace(
+                    "GPU", "org/target", {}, "org/draft", {},
+                    1, 1, 1, 1, None, 0, 0, batch, output_path, {},
+                    False, None, None, None, None, 2, "bf16", "fp16",
+                )
+
+            self.assertEqual(
+                emitted,
+                [
+                    ("org/draft", [10, 20]),
+                    ("org/draft", [11, 21]),
+                    ("org/target", []),
+                ],
+            )
+        finally:
+            os.unlink(output_path)
+
+    def test_generate_trace_dispatches_fused_batch(self):
+        batch = types.SimpleNamespace(
+            batch_id=11,
+            model="org/target",
+            load=0,
+            evict=0,
+            speculative_stage="draft_verify",
+            speculative_draft_model="org/draft",
+        )
+
+        def config_for(model):
+            return {
+                "max_position_embeddings": 4096,
+                "model_type": "llama",
+                "torch_dtype": (
+                    "float16" if model == "org/draft" else "bfloat16"),
+            }
+
+        def emit_fused(*args, **kwargs):
+            output_path = args[13]
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(trace_generator.formatter(
+                    "draft_then_verify", "123", "REMOTE:0", "4",
+                    "LOCAL", "0", "REMOTE:0", "4", "NONE", "0", "NONE",
+                ))
+
+        with tempfile.TemporaryDirectory() as inputs_root:
+            with (
+                mock.patch.object(
+                    trace_generator, "get_config", side_effect=config_for),
+                mock.patch.object(
+                    trace_generator,
+                    "_synthesize_fused_draft_verify_trace",
+                    side_effect=emit_fused,
+                ) as fused,
+                mock.patch.object(
+                    trace_generator, "_synthesize_trace") as regular,
+            ):
+                trace_generator.generate_trace(
+                    batch, "GPU", 1, 1, 1, 1,
+                    dtype="bfloat16", inputs_root=inputs_root,
+                )
+
+            fused.assert_called_once()
+            regular.assert_not_called()
+            output_path = trace_generator.input_path(
+                inputs_root, "trace", "GPU", "org/target",
+                "instance0_batch11.txt",
+            )
+            with open(output_path, encoding="utf-8") as f:
+                trace = f.read()
+            self.assertIn("draft_then_verify_0", trace)
+
+
 if __name__ == "__main__":
     unittest.main()

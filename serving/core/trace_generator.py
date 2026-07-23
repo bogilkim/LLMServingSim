@@ -1353,6 +1353,111 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
+def _emit_standard_trace_body(
+        ctx, bctx, batch, config, block_mode_on, f):
+    """Append one complete model forward pass to an open trace file."""
+    _emit_prologue(ctx, bctx, f)
+
+    num_layers = config['num_hidden_layers']
+    iter_count, copy_count = (
+        (num_layers, 1) if block_mode_on else (1, num_layers))
+    for layer_num in range(iter_count):
+        block_lines, block_power = _build_transformer_block(
+            ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
+
+        # MoE blocks are only safely replayable when the router opts into
+        # block copy. Other routing policies may vary slightly per layer.
+        can_copy = (
+            (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on)
+        if can_copy:
+            for _ in range(copy_count):
+                f.writelines(block_lines)
+                block_power.flush(ctx, ctx.enable_attn_offloading)
+        else:
+            f.writelines(block_lines)
+            block_power.flush(ctx, ctx.enable_attn_offloading)
+
+    _emit_final_layers(ctx, bctx, f)
+    _emit_pp_pd_power(ctx, bctx)
+
+
+def _make_fused_draft_step_batch(batch, step):
+    """Build the decode-shaped draft sub-batch for one proposal token."""
+    kv_lens = [
+        int(batch.speculative_draft_kv_before[req.id]) + step
+        for req in batch.requests
+    ]
+    draft_batch = Batch(
+        batch.batch_id,
+        batch.speculative_draft_model,
+        len(batch.requests),
+        sum(kv_lens),
+        [1] * len(batch.requests),
+        kv_lens,
+        0,
+        len(batch.requests),
+        [],
+        [],
+        kv_lens,
+        batch.batch_time,
+        0,
+    )
+    draft_batch.requests.extend(batch.requests)
+    return draft_batch
+
+
+def _synthesize_fused_draft_verify_trace(
+        hardware, model, config, draft_model, draft_config,
+        tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
+        batch, output_path, placement, block_mode_on, target_gate, draft_gate,
+        power_model, pim_model, fp, target_variant, draft_variant,
+        kv_cache_dtype='auto', runtime_max_num_batched_tokens=None,
+        runtime_max_num_seqs=None, tp_dim=None, ep_dim=None,
+        dp_sum_total_len=0):
+    """Emit N draft forwards followed by one target verification forward."""
+    if pp_size != 1:
+        raise ValueError(
+            "Fused colocated draft_verify traces currently require pp_size=1.")
+
+    target_ctx = _build_trace_ctx(
+        hardware, model, config, tp_size, pp_size, local_ep, ep_total,
+        node_id, fp, placement, target_gate, False, power_model, pim_model,
+        pd_type, variant=target_variant, kv_cache_dtype=kv_cache_dtype,
+        runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
+        runtime_max_num_seqs=runtime_max_num_seqs,
+        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+    )
+    draft_ctx = _build_trace_ctx(
+        hardware, draft_model, draft_config, tp_size, pp_size, local_ep,
+        ep_total, node_id, fp, placement, draft_gate, False, power_model,
+        pim_model, pd_type, variant=draft_variant,
+        kv_cache_dtype=kv_cache_dtype,
+        runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
+        runtime_max_num_seqs=runtime_max_num_seqs,
+        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+    )
+
+    logger.info(
+        "Batch #%d: fused draft_verify draft=%s steps=%d target=%s "
+        "num_reqs=%d req_ids=%s",
+        batch.batch_id, draft_model, batch.speculative_draft_steps, model,
+        len(batch.requests), [req.id for req in batch.requests],
+        extra={"node_id": node_id, "instance_id": instance_id},
+    )
+
+    with open(output_path, 'w') as f:
+        for step in range(int(batch.speculative_draft_steps)):
+            draft_batch = _make_fused_draft_step_batch(batch, step)
+            draft_bctx = _build_batch_ctx(draft_batch, draft_ctx)
+            _emit_standard_trace_body(
+                draft_ctx, draft_bctx, draft_batch, draft_config,
+                block_mode_on, f)
+
+        target_bctx = _build_batch_ctx(batch, target_ctx)
+        _emit_standard_trace_body(
+            target_ctx, target_bctx, batch, config, block_mode_on, f)
+
+
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                       batch, max_len, output_path, placement, block_mode_on, gate,
                       enable_attn_offloading, power_model, pim_model, fp,
@@ -1375,31 +1480,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
     )
 
     with open(output_path, 'w') as f:
-        _emit_prologue(ctx, bctx, f)
-
-        # Transformer blocks
-        num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
-
-        for layer_num in range(iter_count):
-            block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
-
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
-                f.writelines(block_lines)
-                block_power.flush(ctx, enable_attn_offloading)
-
-        # Final layers
-        _emit_final_layers(ctx, bctx, f)
-        _emit_pp_pd_power(ctx, bctx)
+        _emit_standard_trace_body(
+            ctx, bctx, batch, config, block_mode_on, f)
 
 
 # ======================================================================
@@ -1632,8 +1714,41 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    if getattr(batch, "speculative_stage", None) in (
-            "eagle3_seed", "eagle3"):
+    speculative_stage = getattr(batch, "speculative_stage", None)
+    if speculative_stage == "draft_verify":
+        if enable_attn_offloading or enable_sub_batch_interleaving:
+            raise ValueError(
+                "Fused colocated draft_verify traces do not support attention "
+                "offloading or sub-batch interleaving."
+            )
+        draft_model = batch.speculative_draft_model
+        draft_config = get_config(draft_model)
+        draft_variant = resolve_variant(None, kv_cache_dtype, draft_config)
+        draft_num_experts = draft_config.get(
+            "num_local_experts", draft_config.get("num_experts"))
+        if draft_num_experts:
+            draft_gate = GateRouter(
+                node_id, instance_id, draft_num_experts,
+                num_experts_per_tok=draft_config.get(
+                    'num_experts_per_tok', 1),
+                routing_policy=expert_routing_policy,
+                seed=42,
+                block_copy=enable_block_copy,
+            )
+        else:
+            draft_gate = None
+        _synthesize_fused_draft_verify_trace(
+            hardware, model, config, draft_model, draft_config,
+            tp_size, pp_size, local_ep, ep_total, pd_type, node_id,
+            instance_id, batch, output_path, placement, block_mode_on, gate,
+            draft_gate, power_model, pim_model, fp, variant, draft_variant,
+            kv_cache_dtype=kv_cache_dtype,
+            runtime_max_num_batched_tokens=max_num_batched_tokens,
+            runtime_max_num_seqs=max_num_seqs,
+            tp_dim=tp_dim, ep_dim=ep_dim,
+            dp_sum_total_len=dp_sum_total_len,
+        )
+    elif speculative_stage in ("eagle3_seed", "eagle3"):
         if enable_attn_offloading or enable_sub_batch_interleaving:
             raise ValueError(
                 "EAGLE3 aggregate profiles do not support attention offloading "

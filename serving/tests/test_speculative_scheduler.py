@@ -25,10 +25,7 @@ def _stub_optional_dependencies():
 _stub_optional_dependencies()
 
 from serving.core.request import Request
-from serving.core.scheduler import (
-    Scheduler,
-    _validate_speculative_draft_model,
-)
+from serving.core.scheduler import Scheduler
 from serving.core.memory_model import MemoryModel
 from serving.core.speculative import SpeculativeAcceptanceModel
 
@@ -38,6 +35,7 @@ class _Memory:
         self.adjustments = []
         self.adjustment_models = []
         self.block_models = []
+        self.allocations = []
 
     def adjust_tokens(
             self, current_tokens, new_tokens, device, model=None):
@@ -56,7 +54,11 @@ class _Memory:
         return True
 
     def allocate(self, size, device):
-        pass
+        self.allocations.append(size)
+
+    def get_total_kv_tokens(self, tokens, model=None):
+        multiplier = 2 if model == 'org/eagle3-head' else 10
+        return int(tokens) * multiplier
 
 
 class _Logger:
@@ -81,6 +83,7 @@ def _scheduler(role):
     scheduler.inflight = []
     scheduler.batch_ids = -1
     scheduler._last_colocated_model = None
+    scheduler._last_colocated_fused = False
     scheduler.num_npus = 1
     scheduler.pd_type = None
     scheduler.enable_prefix_caching = False
@@ -106,18 +109,71 @@ def _batch(request, stage=None, scheduled_tokens=None):
 
 
 class SpeculativeSchedulerTest(unittest.TestCase):
-    def test_native_eagle3_head_rejects_independent_draft_path(self):
-        with self.assertRaisesRegex(ValueError, "speculative_method='eagle3'"):
-            _validate_speculative_draft_model(
-                'draft_model',
-                'EAGLE/EAGLE3-LLaMA3.1-Instruct-8B',
-                {'speculative_model_type': 'eagle3'},
-            )
+    def test_colocated_schedules_draft_and_verify_as_one_batch(self):
+        scheduler = _scheduler('colocated')
+        scheduler.max_num_batched_tokens = 64
+        requests = []
+        for request_id in range(2):
+            request = Request(request_id, 'target', 10, 30, 0, 0)
+            request.speculative_active = True
+            request.speculative_stage = 'draft_sync'
+            request.speculative_target_tokens = 11
+            request.speculative_target_kv_tokens = 10
+            request.speculative_draft_kv_tokens = 10
+            request.speculative_draft_tokens = 4
+            request.speculative_draft_generated = 0
+            request.num_computed_tokens = 10
+            requests.append(request)
+        scheduler.request = requests.copy()
 
-        _validate_speculative_draft_model(
-            'eagle3',
-            'EAGLE/EAGLE3-LLaMA3.1-Instruct-8B',
-            {'speculative_model_type': 'eagle3'},
+        batch = scheduler.schedule_base(0, 0)
+
+        self.assertEqual(batch.speculative_stage, 'draft_verify')
+        self.assertEqual(batch.model, 'target')
+        self.assertEqual(batch.speculative_draft_model, 'org/eagle3-head')
+        self.assertEqual(batch.speculative_draft_steps, 4)
+        self.assertEqual(batch.scheduled_tokens, {0: 5, 1: 5})
+        self.assertEqual(batch.requests, requests)
+        self.assertEqual(scheduler.request, [])
+        self.assertEqual(scheduler.memory.allocations, [116])
+
+    def test_colocated_fused_completion_applies_acceptance_once(self):
+        scheduler = _scheduler('colocated')
+        request = Request(0, 'target', 10, 30, 0, 0)
+        request.speculative_active = True
+        request.speculative_stage = 'draft_sync'
+        request.speculative_target_tokens = 11
+        request.speculative_target_kv_tokens = 10
+        request.speculative_draft_kv_tokens = 10
+        request.speculative_draft_tokens = 4
+        request.speculative_draft_generated = 0
+        request.speculative_first_commit_pending = True
+        request.num_computed_tokens = 10
+
+        batch = _batch(request, 'draft_verify', {request.id: 5})
+        batch.speculative_target_kv_after = {request.id: 15}
+        batch.speculative_draft_kv_after = {request.id: 14}
+        scheduler.inflight = [batch]
+
+        _, generated, final, transfer = scheduler.add_done(1, 0, 100)
+
+        self.assertEqual(generated, 4)
+        self.assertEqual(final, [])
+        self.assertEqual(transfer, [])
+        self.assertEqual(request.speculative_target_tokens, 14)
+        self.assertEqual(request.speculative_target_kv_tokens, 13)
+        self.assertEqual(request.speculative_draft_kv_tokens, 13)
+        self.assertEqual(request.speculative_stage, 'draft_sync')
+        self.assertEqual(request.speculative_iteration, 1)
+        self.assertEqual(request.ttft, 100)
+        self.assertEqual(request.itl, [0, 0, 0])
+        self.assertEqual(
+            scheduler.memory.adjustments,
+            [(15, 13), (14, 13)],
+        )
+        self.assertEqual(
+            scheduler.memory.adjustment_models,
+            ['target', 'org/eagle3-head'],
         )
 
     def test_colocated_memory_accounts_for_both_models(self):
